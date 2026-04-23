@@ -4995,9 +4995,15 @@ fn scanImportUsage(ctx: *TransformContext) void {
     var local_decls: std.StringHashMapUnmanaged(void) = .empty;
     collectLocalDeclarations(ctx, &local_decls);
 
-    // Step 3: Walk the AST and find value-usages of imported names.
+    // Step 3: Find value-usages of imported names.
+    // When a TransformSession is available, use its pre-built identifier
+    // occurrence index instead of recursively walking the entire AST.
     var value_used: std.StringHashMapUnmanaged(void) = .empty;
-    scanValueUsages(ctx, @enumFromInt(0), false, &value_used, &local_decls);
+    if (ctx.session) |session| {
+        scanValueUsagesViaSession(ctx, session, &value_used, &local_decls);
+    } else {
+        scanValueUsages(ctx, @enumFromInt(0), false, &value_used, &local_decls);
+    }
 
     // Step 3b: If JSX exists in the file, mark JSX pragma root identifiers as value-used.
     markJsxPragmaImports(ctx, &value_used);
@@ -5025,12 +5031,23 @@ fn scanImportUsage(ctx: *TransformContext) void {
 }
 
 /// Collect all imported binding names from import declarations.
+/// Only scans program body statements since imports are top-level.
 fn collectImportedNames(ctx: *TransformContext) void {
     const tags = ctx.ast.nodes.items(.tag);
     const datas = ctx.ast.nodes.items(.data);
     const main_tokens = ctx.ast.nodes.items(.main_token);
 
-    for (tags, 0..) |tag, i| {
+    if (tags.len == 0 or tags[0] != .program) return;
+    const program_data = datas[0];
+    const program_extra = @intFromEnum(program_data.extra);
+    const range_start = ctx.ast.extra_data.items[program_extra];
+    const range_end = ctx.ast.extra_data.items[program_extra + 1];
+
+    for (ctx.ast.extra_data.items[range_start..range_end]) |stmt_raw| {
+        if (stmt_raw >= tags.len) continue;
+        const tag = tags[stmt_raw];
+        const i = stmt_raw;
+
         switch (tag) {
             .import_declaration => {
                 const data = datas[i];
@@ -5042,13 +5059,11 @@ fn collectImportedNames(ctx: *TransformContext) void {
                     const spec_tag = tags[s];
                     switch (spec_tag) {
                         .import_default, .import_namespace => {
-                            // main_token is the local binding name
                             const tok = main_tokens[s];
                             const name = ctx.tokenSlice(tok);
                             ctx.all_import_names.put(ctx.allocator, name, {}) catch {};
                         },
                         .import_specifier => {
-                            // extra[0]=imported_token, [1]=local_token
                             const spec_data = datas[s];
                             const spec_extra = @intFromEnum(spec_data.extra);
                             const local_tok: TokenIndex = @enumFromInt(ctx.ast.extra_data.items[spec_extra + 1]);
@@ -5056,7 +5071,6 @@ fn collectImportedNames(ctx: *TransformContext) void {
                             ctx.all_import_names.put(ctx.allocator, name, {}) catch {};
                         },
                         .import_specifier_type, .import_specifier_typeof => {
-                            // These are already type-only by syntax; collect but mark immediately
                             const spec_data = datas[s];
                             const spec_extra = @intFromEnum(spec_data.extra);
                             const local_tok: TokenIndex = @enumFromInt(ctx.ast.extra_data.items[spec_extra + 1]);
@@ -5069,7 +5083,6 @@ fn collectImportedNames(ctx: *TransformContext) void {
                 }
             },
             .import_declaration_type => {
-                // `import type { ... }` — all names are type-only
                 const data = datas[i];
                 const extra_idx = @intFromEnum(data.extra);
                 const specs_start = ctx.ast.extra_data.items[extra_idx + 1];
@@ -5102,13 +5115,42 @@ fn collectImportedNames(ctx: *TransformContext) void {
 }
 
 /// Collect local declarations that shadow imported names.
-/// E.g., `import { Foo } from 'foo'; function Foo() {}` — Foo is locally declared.
+/// Only scans program body statements since top-level shadows are what matter.
 fn collectLocalDeclarations(ctx: *TransformContext, local_decls: *std.StringHashMapUnmanaged(void)) void {
     const tags = ctx.ast.nodes.items(.tag);
     const datas = ctx.ast.nodes.items(.data);
     const main_tokens = ctx.ast.nodes.items(.main_token);
 
-    for (tags, 0..) |tag, i| {
+    if (tags.len == 0 or tags[0] != .program) return;
+    const program_data = datas[0];
+    const program_extra = @intFromEnum(program_data.extra);
+    const range_start = ctx.ast.extra_data.items[program_extra];
+    const range_end = ctx.ast.extra_data.items[program_extra + 1];
+
+    for (ctx.ast.extra_data.items[range_start..range_end]) |stmt_raw| {
+        if (stmt_raw >= tags.len) continue;
+        var tag = tags[stmt_raw];
+        var i = stmt_raw;
+
+        // Unwrap export_named to reach the inner declaration
+        if (tag == .export_named) {
+            const ed = datas[i];
+            const eidx = @intFromEnum(ed.extra);
+            if (eidx + 3 < ctx.ast.extra_data.items.len) {
+                const decl_raw = ctx.ast.extra_data.items[eidx + 3];
+                if (decl_raw != @intFromEnum(NodeIndex.none) and decl_raw < tags.len) {
+                    tag = tags[decl_raw];
+                    i = decl_raw;
+                } else continue;
+            } else continue;
+        } else if (tag == .export_default) {
+            const ed = datas[i];
+            if (ed.unary != .none and @intFromEnum(ed.unary) < tags.len) {
+                tag = tags[@intFromEnum(ed.unary)];
+                i = @intFromEnum(ed.unary);
+            } else continue;
+        }
+
         switch (tag) {
             .function_declaration,
             .async_function_declaration,
@@ -5116,7 +5158,6 @@ fn collectLocalDeclarations(ctx: *TransformContext, local_decls: *std.StringHash
             .async_generator_declaration,
             .class_declaration,
             => {
-                // extra[0] = name TOKEN (not a node!)
                 const data = datas[i];
                 const extra_idx = @intFromEnum(data.extra);
                 if (extra_idx < ctx.ast.extra_data.items.len) {
@@ -5131,7 +5172,6 @@ fn collectLocalDeclarations(ctx: *TransformContext, local_decls: *std.StringHash
                 }
             },
             .ts_enum_declaration => {
-                // extra[0] = name node
                 const name_str = getNodeDeclName(ctx, @enumFromInt(i));
                 if (name_str) |name| {
                     if (ctx.all_import_names.contains(name)) {
@@ -5140,7 +5180,6 @@ fn collectLocalDeclarations(ctx: *TransformContext, local_decls: *std.StringHash
                 }
             },
             .ts_type_alias_declaration => {
-                // extra[0] = id node
                 const name_str = getNodeDeclName(ctx, @enumFromInt(i));
                 if (name_str) |name| {
                     if (ctx.all_import_names.contains(name)) {
@@ -5149,7 +5188,6 @@ fn collectLocalDeclarations(ctx: *TransformContext, local_decls: *std.StringHash
                 }
             },
             .ts_interface_declaration => {
-                // extra[0] = name node
                 const data = datas[i];
                 const extra_idx = @intFromEnum(data.extra);
                 if (extra_idx < ctx.ast.extra_data.items.len) {
@@ -5578,6 +5616,176 @@ fn sourceContainsDecoratorIdent(source: []const u8, name: []const u8) bool {
             }
         }
         return true;
+    }
+    return false;
+}
+
+/// Session-backed value-usage scan: for each imported name, look up its
+/// pre-indexed identifier occurrences and check whether any are outside
+/// a type-only context by walking ancestors through the session's parent map.
+/// Also checks export specifiers, which use tokens rather than child nodes
+/// and therefore are not tracked in `identifierOccurrences`.
+fn scanValueUsagesViaSession(
+    ctx: *TransformContext,
+    session: *const @import("session.zig").TransformSession,
+    value_used: *std.StringHashMapUnmanaged(void),
+    local_decls: *const std.StringHashMapUnmanaged(void),
+) void {
+    // Phase 1: check identifier occurrences from the session index.
+    var name_iter = ctx.all_import_names.keyIterator();
+    while (name_iter.next()) |key| {
+        const name = key.*;
+        if (local_decls.contains(name)) continue;
+        if (value_used.contains(name)) continue;
+        const occurrences = session.identifierOccurrences(name) orelse continue;
+        for (occurrences) |occ| {
+            if (!isInTypeContext(ctx, session, occ.node)) {
+                value_used.put(ctx.allocator, name, {}) catch {};
+                break;
+            }
+        }
+    }
+
+    // Phase 2: export specifiers use tokens (not child nodes), so they
+    // are invisible to the identifier occurrence index. Scan program body
+    // for specifier-only `export { ... }` statements.
+    const tags = ctx.ast.nodes.items(.tag);
+    const datas = ctx.ast.nodes.items(.data);
+    if (tags.len == 0 or tags[0] != .program) return;
+    const program_data = datas[0];
+    const program_extra = @intFromEnum(program_data.extra);
+    const range_start = ctx.ast.extra_data.items[program_extra];
+    const range_end = ctx.ast.extra_data.items[program_extra + 1];
+
+    for (ctx.ast.extra_data.items[range_start..range_end]) |stmt_raw| {
+        if (stmt_raw >= tags.len) continue;
+        if (tags[stmt_raw] != .export_named) continue;
+        const data = datas[stmt_raw];
+        const extra_idx = @intFromEnum(data.extra);
+        // Skip re-exports (have a `from` clause).
+        if (ctx.ast.extra_data.items[extra_idx] != 0) continue;
+        // Skip exports with a declaration.
+        if (extra_idx + 3 < ctx.ast.extra_data.items.len) {
+            const decl_raw = ctx.ast.extra_data.items[extra_idx + 3];
+            if (decl_raw != @intFromEnum(NodeIndex.none)) continue;
+        }
+        const specs_start = ctx.ast.extra_data.items[extra_idx + 1];
+        const specs_end = ctx.ast.extra_data.items[extra_idx + 2];
+        for (ctx.ast.extra_data.items[specs_start..specs_end]) |s| {
+            if (s >= tags.len) continue;
+            if (tags[s] == .export_specifier_type) continue;
+            if (tags[s] != .export_specifier) continue;
+            const spec_data = datas[s];
+            const spec_extra = @intFromEnum(spec_data.extra);
+            const local_tok: TokenIndex = @enumFromInt(ctx.ast.extra_data.items[spec_extra]);
+            const name = ctx.tokenSlice(local_tok);
+            if (ctx.all_import_names.contains(name) and !local_decls.contains(name)) {
+                value_used.put(ctx.allocator, name, {}) catch {};
+            }
+        }
+    }
+}
+
+/// Walk ancestors of `node` via the session parent map to determine whether
+/// it sits inside a type-only subtree. Returns true when the identifier
+/// should NOT count as a value-usage.
+fn isInTypeContext(
+    ctx: *const TransformContext,
+    session: *const @import("session.zig").TransformSession,
+    node: NodeIndex,
+) bool {
+    const tags = ctx.ast.nodes.items(.tag);
+    const datas = ctx.ast.nodes.items(.data);
+
+    var current = node;
+    // Walk up ancestors. Limit depth to avoid pathological cases.
+    var depth: u32 = 0;
+    while (depth < 1000) : (depth += 1) {
+        const parent_opt = session.parentOf(current);
+        if (parent_opt == null) break;
+        const parent = parent_opt.?;
+        const pi = @intFromEnum(parent);
+        if (pi >= tags.len) break;
+        const ptag = tags[pi];
+
+        switch (ptag) {
+            // Pure type nodes — anything inside is type-only.
+            .ts_type_annotation,
+            .ts_type_reference,
+            .ts_keyword_type,
+            .ts_array_type,
+            .ts_tuple_type,
+            .ts_union_type,
+            .ts_intersection_type,
+            .ts_function_type,
+            .ts_constructor_type,
+            .ts_parenthesized_type,
+            .ts_optional_type,
+            .ts_rest_type,
+            .ts_literal_type,
+            .ts_type_parameter,
+            .ts_type_parameter_declaration,
+            .ts_type_parameter_instantiation,
+            .ts_conditional_type,
+            .ts_infer_type,
+            .ts_mapped_type,
+            .ts_indexed_access_type,
+            .ts_template_literal_type,
+            .ts_typeof_type,
+            .ts_type_operator,
+            .ts_type_predicate,
+            .ts_import_type,
+            .ts_named_tuple_member,
+            .ts_type_alias_declaration,
+            .ts_interface_declaration,
+            .ts_interface_body,
+            .ts_type_literal,
+            .ts_property_signature,
+            .ts_method_signature,
+            .ts_index_signature,
+            .ts_call_signature_declaration,
+            .ts_construct_signature_declaration,
+            .ts_declare_function,
+            .ts_declare_variable,
+            .ts_declare_method,
+            .import_declaration_type,
+            .import_specifier_type,
+            .import_specifier_typeof,
+            .export_named_type,
+            .export_specifier_type,
+            => return true,
+
+            // ts_as_expression / ts_satisfies_expression: rhs is type.
+            .ts_as_expression, .ts_satisfies_expression => {
+                const d = datas[pi];
+                if (current == d.binary.rhs) return true;
+            },
+
+            // ts_type_assertion: <Type>expr — lhs is type.
+            .ts_type_assertion => {
+                const d = datas[pi];
+                if (current == d.binary.lhs) return true;
+            },
+
+            // ts_instantiation_expression: expr<Type> — rhs is type.
+            .ts_instantiation_expression => {
+                const d = datas[pi];
+                if (current == d.binary.rhs) return true;
+            },
+
+            // Import binding sites — these are definitions, not usages.
+            .import_declaration, .import_default, .import_namespace, .import_specifier => return true,
+
+            // Property key position — not a value reference to import.
+            .property => {
+                const d = datas[pi];
+                if (current == d.binary.lhs) return true;
+            },
+
+            else => {},
+        }
+
+        current = parent;
     }
     return false;
 }
