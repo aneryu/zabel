@@ -1,0 +1,52 @@
+{
+  "packages": [
+    {
+      "project": "react-native",
+      "version": "0.76.1",
+      "tarball": "https://registry.npmjs.org/react-native/-/react-native-0.76.1.tgz",
+      "root": "package",
+      "files": [
+        {
+          "path": "Libraries/Animated/AnimatedImplementation.js",
+          "tiers": ["smoke", "core", "full"]
+        },
+        {
+          "path": "Libraries/Animated/nodes/AnimatedValue.js",
+          "tiers": ["core", "full"]
+        },
+        {
+          "path": "Libraries/Interaction/PanResponder.js",
+          "tiers": ["core", "full"]
+        },
+        {
+          "path": "Libraries/Components/TextInput/TextInput.flow.js",
+          "tiers": ["full"]
+        }
+      ]
+    },
+    {
+      "project": "antd",
+      "version": "5.21.6",
+      "tarball": "https://registry.npmjs.org/antd/-/antd-5.21.6.tgz",
+      "root": "package",
+      "files": [
+        {
+          "path": "es/form/Form.js",
+          "tiers": ["smoke", "core", "full"]
+        },
+        {
+          "path": "es/table/InternalTable.js",
+          "tiers": ["core", "full"]
+        },
+        {
+          "path": "es/table/hooks/useSelection.js",
+          "tiers": ["core", "full"]
+        },
+        {
+          "path": "es/tabs/style/index.js",
+          "tiers": ["full"]
+        }
+      ]
+    }
+  ]
+}
