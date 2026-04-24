@@ -112,9 +112,14 @@ pub fn createPass(config: TsStripConfig) Pass {
     filter.set(@intFromEnum(Node.Tag.ts_export_assignment));
     filter.set(@intFromEnum(Node.Tag.ts_namespace_export_declaration));
 
+    var exit_filter = visitor.NodeTagBitSet.initEmpty();
+    exit_filter.set(@intFromEnum(Node.Tag.program));
+    exit_filter.set(@intFromEnum(Node.Tag.ts_module_declaration));
+
     return .{
         .name = "ts_strip",
         .node_filter = filter,
+        .exit_filter = exit_filter,
         .enter = enterNode,
         .exit = exitNode,
         .priority = 10,

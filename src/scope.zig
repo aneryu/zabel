@@ -143,10 +143,15 @@ pub const ScopeResult = struct {
     binding_name_indices: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(u32)),
     node_to_scope: DenseNodeMap(ScopeIndex),
     node_to_binding: DenseNodeMap(u32),
-    /// Backing allocation for node_to_scope and node_to_binding (single block).
+    /// Backing allocation for DenseNodeMaps and traversal data (single block).
     dense_map_block: []u32 = &.{},
     /// Pre-computed containing function scope for each scope index.
     containing_fn_scope: []const ScopeIndex = &.{},
+    /// Traversal data built during scope analysis for TransformSession.
+    traversal_parent_map: []NodeIndex = &.{},
+    traversal_preorder_start: []u32 = &.{},
+    traversal_preorder_end: []u32 = &.{},
+    traversal_fn_boundary: []NodeIndex = &.{},
     allocator: Allocator,
 
     pub fn deinit(self: *ScopeResult) void {
@@ -203,6 +208,14 @@ pub fn analyzeWithOptions(ast: *const Ast, allocator: Allocator, options: Analyz
     builder.node_to_binding = .{};
     const dense_map_block = builder.dense_map_block;
     builder.dense_map_block = &.{};
+    const traversal_parent_map = builder.traversal_parent_map;
+    builder.traversal_parent_map = &.{};
+    const traversal_preorder_start = builder.traversal_preorder_start;
+    builder.traversal_preorder_start = &.{};
+    const traversal_preorder_end = builder.traversal_preorder_end;
+    builder.traversal_preorder_end = &.{};
+    const traversal_fn_boundary = builder.traversal_fn_boundary;
+    builder.traversal_fn_boundary = &.{};
 
     // Pre-compute containing function scope for each scope.
     const containing_fn_scope = try buildContainingFnScope(allocator, scopes);
@@ -217,6 +230,10 @@ pub fn analyzeWithOptions(ast: *const Ast, allocator: Allocator, options: Analyz
         .node_to_binding = node_to_binding,
         .dense_map_block = dense_map_block,
         .containing_fn_scope = containing_fn_scope,
+        .traversal_parent_map = traversal_parent_map,
+        .traversal_preorder_start = traversal_preorder_start,
+        .traversal_preorder_end = traversal_preorder_end,
+        .traversal_fn_boundary = traversal_fn_boundary,
         .allocator = allocator,
     };
 }
@@ -390,11 +407,20 @@ const Builder = struct {
     binding_name_indices: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(u32)),
     node_to_scope: DenseNodeMap(ScopeIndex),
     node_to_binding: DenseNodeMap(u32),
-    /// Single backing allocation for both DenseNodeMaps.
+    /// Single backing allocation for DenseNodeMaps + traversal data.
     dense_map_block: []u32 = &.{},
     /// Stack of scope indices during traversal
     scope_stack: std.ArrayListUnmanaged(ScopeIndex),
     options: AnalyzeOptions,
+
+    // Traversal state — builds parent/preorder/function-boundary alongside scope analysis.
+    traversal_parent_map: []NodeIndex = &.{},
+    traversal_preorder_start: []u32 = &.{},
+    traversal_preorder_end: []u32 = &.{},
+    traversal_fn_boundary: []NodeIndex = &.{},
+    current_parent: NodeIndex = .none,
+    current_fn_node: NodeIndex = .none,
+    preorder_cursor: u32 = 0,
 
     fn init(ast: *const Ast, allocator: Allocator, options: AnalyzeOptions) Builder {
         return .{
@@ -463,11 +489,20 @@ const Builder = struct {
     fn run(self: *Builder) !void {
         if (self.ast.nodes.len == 0) return;
         const node_count = self.ast.nodes.items(.tag).len;
-        // Single allocation for both dense node maps.
-        self.dense_map_block = try self.allocator.alloc(u32, node_count * 2);
-        @memset(self.dense_map_block, dense_node_map_none);
+        // Single allocation for DenseNodeMaps (2 slices) + traversal data (4 slices).
+        // Layout: [node_to_scope | node_to_binding | parent_map | fn_boundary | preorder_start | preorder_end]
+        // First 4 slices init to maxInt(u32), last 2 slices init to 0.
+        const total_slices = 6;
+        const max_init_slices = 4;
+        self.dense_map_block = try self.allocator.alloc(u32, node_count * total_slices);
+        @memset(self.dense_map_block[0 .. node_count * max_init_slices], std.math.maxInt(u32));
+        @memset(self.dense_map_block[node_count * max_init_slices ..], 0);
         self.node_to_scope.values = self.dense_map_block[0..node_count];
         self.node_to_binding.values = self.dense_map_block[node_count .. node_count * 2];
+        self.traversal_parent_map = @ptrCast(self.dense_map_block[node_count * 2 .. node_count * 3]);
+        self.traversal_fn_boundary = @ptrCast(self.dense_map_block[node_count * 3 .. node_count * 4]);
+        self.traversal_preorder_start = self.dense_map_block[node_count * 4 .. node_count * 5];
+        self.traversal_preorder_end = self.dense_map_block[node_count * 5 .. node_count * 6];
 
         // Create root scope
         const root_kind: ScopeKind = if (self.ast.source_type == .module) .module else .global;
@@ -480,6 +515,17 @@ const Builder = struct {
         // Finalize the root scope's bindings_end
         self.finalizeCurrentScope();
         _ = self.scope_stack.pop();
+
+        // Assign unique preorder values to orphan nodes (not reachable from root).
+        if (self.preorder_cursor < node_count) {
+            for (0..node_count) |raw| {
+                if (self.traversal_preorder_end[raw] != 0) continue;
+                if (raw == 0 and self.traversal_preorder_start[0] == 0 and node_count > 0) continue;
+                self.traversal_preorder_start[raw] = self.preorder_cursor;
+                self.preorder_cursor += 1;
+                self.traversal_preorder_end[raw] = self.preorder_cursor;
+            }
+        }
     }
 
     fn currentScope(self: *const Builder) ScopeIndex {
@@ -610,12 +656,26 @@ const Builder = struct {
         const tag = tags[i];
         if (tag == .removed) return;
 
+        // ── Traversal data ───────────────────────────────────────────
+        self.traversal_parent_map[i] = self.current_parent;
+        self.traversal_fn_boundary[i] = self.current_fn_node;
+        self.traversal_preorder_start[i] = self.preorder_cursor;
+        self.preorder_cursor += 1;
+
+        const saved_parent = self.current_parent;
+        const saved_fn = self.current_fn_node;
+        self.current_parent = idx;
+        if (isFunctionBoundary(tag)) self.current_fn_node = idx;
+
         // Map this node to the current scope
         self.node_to_scope.putDirect(i, self.currentScope());
 
         // Leaf tags have no children; only .identifier needs binding resolution.
         if (visitor.isLeafTag(tag)) {
             if (tag == .identifier) self.visitIdentifierRef(idx);
+            self.traversal_preorder_end[i] = self.preorder_cursor;
+            self.current_parent = saved_parent;
+            self.current_fn_node = saved_fn;
             return;
         }
 
@@ -686,10 +746,77 @@ const Builder = struct {
             // ── Default: recurse into children ───────────────────────
             else => try self.visitChildren(idx),
         }
+
+        self.traversal_preorder_end[i] = self.preorder_cursor;
+        self.current_parent = saved_parent;
+        self.current_fn_node = saved_fn;
+    }
+
+    /// Track traversal data for a subtree that scope analysis does not visit
+    /// (e.g. non-computed property keys, import specifiers).
+    fn trackSubtreeTraversal(self: *Builder, idx: NodeIndex) void {
+        if (idx == .none) return;
+        const i = @intFromEnum(idx);
+        const tags = self.ast.nodes.items(.tag);
+        if (i >= tags.len) return;
+        const tag = tags[i];
+        if (tag == .removed) return;
+
+        self.traversal_parent_map[i] = self.current_parent;
+        self.traversal_fn_boundary[i] = self.current_fn_node;
+        self.traversal_preorder_start[i] = self.preorder_cursor;
+        self.preorder_cursor += 1;
+
+        if (visitor.isLeafTag(tag)) {
+            self.traversal_preorder_end[i] = self.preorder_cursor;
+            return;
+        }
+
+        const saved_parent = self.current_parent;
+        self.current_parent = idx;
+
+        const children = visitor.getChildren(self.ast, idx);
+        for (children.items[0..children.len]) |child| {
+            self.trackSubtreeTraversal(child);
+        }
+        if (children.range_end > children.range_start) {
+            for (self.ast.extra_data.items[children.range_start..children.range_end]) |raw| {
+                self.trackSubtreeTraversal(@enumFromInt(raw));
+            }
+        }
+        if (children.range2_end > children.range2_start) {
+            for (self.ast.extra_data.items[children.range2_start..children.range2_end]) |raw| {
+                self.trackSubtreeTraversal(@enumFromInt(raw));
+            }
+        }
+
+        self.current_parent = saved_parent;
+        self.traversal_preorder_end[i] = self.preorder_cursor;
+    }
+
+    fn isFunctionBoundary(tag: Node.Tag) bool {
+        return switch (tag) {
+            .function_declaration,
+            .async_function_declaration,
+            .generator_declaration,
+            .async_generator_declaration,
+            .function_expr,
+            .arrow_function_expr,
+            .method_definition,
+            .computed_method,
+            .class_method,
+            .class_private_method,
+            .getter,
+            .setter,
+            => true,
+            else => false,
+        };
     }
 
     fn visitProperty(self: *Builder, data: Node.Data) !void {
         // Non-computed object property keys are names, not identifier references.
+        // Track the key subtree for traversal data but skip scope analysis.
+        self.trackSubtreeTraversal(data.binary.lhs);
         // The value side still contains runtime references in both object literals
         // and object-pattern assignment targets.
         try self.visit(data.binary.rhs);
@@ -706,6 +833,8 @@ const Builder = struct {
         const is_computed = (flags & 2) != 0;
         if (is_computed) {
             try self.visit(key);
+        } else {
+            self.trackSubtreeTraversal(key);
         }
         try self.visit(value);
     }
@@ -816,6 +945,7 @@ const Builder = struct {
                 const param_node: NodeIndex = @enumFromInt(first);
                 if (param_node != .none) {
                     try self.collectBindingNames(param_node, .param);
+                    self.trackSubtreeTraversal(param_node);
                 }
                 const body: NodeIndex = @enumFromInt(second);
                 try self.visit(body);
@@ -1069,6 +1199,14 @@ const Builder = struct {
                 const decl_tag = self.ast.nodes.items(.tag)[decl_i];
                 if (decl_tag != .declarator) continue;
 
+                // Track traversal data for declarator node.
+                self.traversal_parent_map[decl_i] = self.current_parent;
+                self.traversal_fn_boundary[decl_i] = self.current_fn_node;
+                self.traversal_preorder_start[decl_i] = self.preorder_cursor;
+                self.preorder_cursor += 1;
+                const saved_parent = self.current_parent;
+                self.current_parent = decl_idx;
+
                 const decl_data = self.ast.nodes.items(.data)[decl_i];
                 // declarator: binary.lhs = binding pattern, binary.rhs = init
                 const binding_node = decl_data.binary.lhs;
@@ -1081,14 +1219,22 @@ const Builder = struct {
                     .init_node = decl_data.binary.rhs,
                 });
 
+                // Track binding pattern subtree (not visited by visit()).
+                self.trackSubtreeTraversal(binding_node);
+
                 // Visit the initializer
                 try self.visit(decl_data.binary.rhs);
+
+                // Close declarator preorder range.
+                self.traversal_preorder_end[decl_i] = self.preorder_cursor;
+                self.current_parent = saved_parent;
             }
         }
     }
 
     fn visitImportDeclaration(self: *Builder, _: NodeIndex, data: Node.Data) !void {
-        // import_declaration: extra[0]=source_token, [1]=specs_start, [2]=specs_end
+        // import_declaration: extra[0]=source_token, [1]=specs_start, [2]=specs_end,
+        // optional [3]=attrs_start, [4]=attrs_end
         const extra_idx = @intFromEnum(data.extra);
         const specs_start = self.ast.extra_data.items[extra_idx + 1];
         const specs_end = self.ast.extra_data.items[extra_idx + 2];
@@ -1096,6 +1242,10 @@ const Builder = struct {
         if (specs_end > specs_start) {
             for (self.ast.extra_data.items[specs_start..specs_end]) |raw| {
                 const spec_idx: NodeIndex = @enumFromInt(raw);
+                // Track traversal data for specifier nodes (scope analysis reads them
+                // directly for binding extraction but doesn't call visit()).
+                self.trackSubtreeTraversal(spec_idx);
+
                 if (spec_idx == .none) continue;
                 const spec_i = @intFromEnum(spec_idx);
                 if (spec_i >= self.ast.nodes.items(.tag).len) continue;
@@ -1129,6 +1279,17 @@ const Builder = struct {
                 }
             }
         }
+
+        // Track import attributes if present.
+        if (extra_idx + 4 < self.ast.extra_data.items.len) {
+            const attrs_start = self.ast.extra_data.items[extra_idx + 3];
+            const attrs_end = self.ast.extra_data.items[extra_idx + 4];
+            if (attrs_end > attrs_start) {
+                for (self.ast.extra_data.items[attrs_start..attrs_end]) |raw| {
+                    self.trackSubtreeTraversal(@enumFromInt(raw));
+                }
+            }
+        }
     }
 
     fn visitMethodLike(self: *Builder, idx: NodeIndex, data: Node.Data) !void {
@@ -1148,6 +1309,8 @@ const Builder = struct {
         };
         if (is_computed) {
             try self.visit(key);
+        } else {
+            self.trackSubtreeTraversal(key);
         }
 
         _ = try self.pushScope(.function, idx);
@@ -1166,6 +1329,17 @@ const Builder = struct {
     fn visitGetterSetter(self: *Builder, idx: NodeIndex, data: Node.Data) !void {
         // getter/setter: extra[0]=params_start, [1]=params_end, [2]=body, [3]=flags, [4]=computed_key
         const extra_idx = @intFromEnum(data.extra);
+
+        // Track computed key if present (getChildren includes it).
+        const flags = if (extra_idx + 3 < self.ast.extra_data.items.len)
+            self.ast.extra_data.items[extra_idx + 3]
+        else
+            0;
+        const is_computed = (flags & 8) != 0;
+        if (is_computed and extra_idx + 4 < self.ast.extra_data.items.len) {
+            const computed_key: NodeIndex = @enumFromInt(self.ast.extra_data.items[extra_idx + 4]);
+            try self.visit(computed_key);
+        }
 
         _ = try self.pushScope(.function, idx);
 
@@ -1242,6 +1416,8 @@ const Builder = struct {
         for (self.ast.extra_data.items[params_start..params_end]) |raw| {
             const param_idx: NodeIndex = @enumFromInt(raw);
             try self.collectBindingNames(param_idx, .param);
+            // Track traversal data for param subtree (not visited by visit()).
+            self.trackSubtreeTraversal(param_idx);
         }
     }
 

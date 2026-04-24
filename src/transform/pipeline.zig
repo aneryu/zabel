@@ -183,6 +183,8 @@ pub const TransformContext = struct {
 pub const Pass = struct {
     name: []const u8,
     node_filter: visitor.NodeTagBitSet,
+    /// When non-null, limits exit dispatch to this tag set instead of node_filter.
+    exit_filter: ?visitor.NodeTagBitSet = null,
     enter: ?*const fn (NodeIndex, *TransformContext) visitor.VisitResult = null,
     exit: ?*const fn (NodeIndex, *TransformContext) visitor.VisitResult = null,
     priority: u8 = 128,
@@ -694,10 +696,10 @@ pub const Pipeline = struct {
         var exit_counts = [_]usize{0} ** dispatch_tag_count;
 
         for (self.passes.items) |pass| {
+            const exit_set = pass.exit_filter orelse pass.node_filter;
             for (0..dispatch_tag_count) |tag_index| {
-                if (!pass.node_filter.isSet(tag_index)) continue;
-                if (pass.enter != null) enter_counts[tag_index] += 1;
-                if (pass.exit != null) exit_counts[tag_index] += 1;
+                if (pass.enter != null and pass.node_filter.isSet(tag_index)) enter_counts[tag_index] += 1;
+                if (pass.exit != null and exit_set.isSet(tag_index)) exit_counts[tag_index] += 1;
             }
         }
 
@@ -720,14 +722,14 @@ pub const Pipeline = struct {
         var enter_cursor = table.enter_ranges;
         var exit_cursor = table.exit_ranges;
         for (self.passes.items, 0..) |pass, pass_index| {
+            const exit_set = pass.exit_filter orelse pass.node_filter;
             for (0..dispatch_tag_count) |tag_index| {
-                if (!pass.node_filter.isSet(tag_index)) continue;
-                if (pass.enter != null) {
+                if (pass.enter != null and pass.node_filter.isSet(tag_index)) {
                     const cursor = &enter_cursor[tag_index];
                     table.enter_indices[cursor.start] = pass_index;
                     cursor.start += 1;
                 }
-                if (pass.exit != null) {
+                if (pass.exit != null and exit_set.isSet(tag_index)) {
                     const cursor = &exit_cursor[tag_index];
                     table.exit_indices[cursor.start] = pass_index;
                     cursor.start += 1;

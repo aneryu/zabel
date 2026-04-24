@@ -40,11 +40,15 @@
 - `useSelection.js` profile results (median of 5, 3 warmups): `scope_analysis_ns` dropped from `10.1M` to `9.5M` (−6.2%), `transform_session_ns` dropped from `7.5M` to `7.0M` (−5.9%), `pipeline_ns` dropped from `44.6M` to `42.6M` (−4.4%).
 - `core` tier total: `zig_total_ns` dropped from `296.2M` to `291.5M` (−1.6%), `p95_total_ns` dropped from `84.7M` to `83.3M` (−1.7%). All 6 files improved.
 
+- Merged parent/preorder/function-boundary traversal into scope analysis: `Builder.visit()` now computes `parent_map`, `preorder_start`, `preorder_end`, and `function_boundary_for_node` alongside scope analysis. Ownership transfers to `ScopeResult` via 4 new traversal fields. `TransformSession.init()` borrows these arrays when available, allocating only its 2 local slices (`function_binding_name_node`, `resolved_binding_for_node`). Added `buildOccurrencesLinear()` for identifier/this occurrence collection without recursive traversal. Added `trackSubtreeTraversal()` for non-visited subtrees (import specifiers, non-computed keys, params, class fields). Fixed `visitVarDeclaration()` to track declarator nodes and binding patterns.
+- Added `exit_filter` to `Pass` struct: when set, limits exit dispatch to a smaller tag set instead of the full `node_filter`. Applied to `ts_strip` (exit only needs `.program` and `.ts_module_declaration`), reducing exit dispatch from ~1540 calls/iteration to 1.
+- `useSelection.js` profile results (sum of 5 iterations, 3 warmups): `transform_session_ns` dropped from `7.3M` to `3.7M` (−49%), `traversal_ns` dropped from `18.7M` to `17.2M` (−8.2%), `pipeline_ns` dropped from `43.8M` to `40.4M` (−7.7%). `scope_analysis_ns` increased from `9.4M` to `10.9M` (+15.5%) as expected (more work moved into scope phase).
+- `core` tier total: all 6 files improved (−2.5% to −5.8%).
+
 ## Likely Next Steps
 
-- `traversal_ns` (~18.2M) is the single largest component; further gains likely require reducing per-node overhead in `Pipeline.visitNode` (e.g. inlining hot paths, reducing function-call depth for single-child chains).
-- `scope_analysis_ns` (~9.5M) is still significant; the `findVisibleBindingIndex` hash lookup + scope-chain walk for each identifier is the per-node bottleneck — a name→binding cache updated on scope push/pop could eliminate many repeated lookups.
-- Merging the parent/preorder traversal into scope analysis would eliminate the second full-AST walk, saving ~7M ns, but requires coupling scope analysis to TransformSession data structures.
+- `traversal_ns` (~17.2M) is still the single largest component; further gains likely require reducing per-node overhead in `Pipeline.visitNode` (e.g. inlining hot paths, reducing function-call depth for single-child chains).
+- `scope_analysis_ns` (~10.9M) is now the second largest; the `findVisibleBindingIndex` hash lookup + scope-chain walk for each identifier is the per-node bottleneck — a name→binding cache updated on scope push/pop could eliminate many repeated lookups.
 - Keep removing pass-local structural or lookup caches when equivalent session-backed data already exists.
 - Treat `core` before/after measurements as the acceptance metric; use `full` as a confirmation run after material shared-infrastructure changes.
 
@@ -67,3 +71,5 @@
 - 2026-04-24: `zig build conformance-test` completed: parser `5891 pass / 0 fail`, codegen `486 pass / 0 fail`, transform `829 pass / 5 fail` (same pre-existing failures as baseline).
 - 2026-04-24: `zig build test` passed after scope analysis leaf-tag fast path, DenseNodeMap consolidation, and containing_fn_scope pre-computation.
 - 2026-04-24: `zig build conformance-test` completed: transform `829 pass / 5 fail` (same pre-existing failures).
+- 2026-04-24: `zig build test` passed after merging traversal into scope analysis and adding exit_filter.
+- 2026-04-24: `zig build conformance-test` completed: parser `5891 pass / 0 fail`, transform `832 pass / 2 fail` (same 2 pre-existing failures).

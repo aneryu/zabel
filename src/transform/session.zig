@@ -37,35 +37,64 @@ pub const TransformSession = struct {
     unresolved_occurrences: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(IdentifierOccurrence)),
     this_occurrences: std.ArrayListUnmanaged(NodeIndex),
 
-    // Consolidated block layout (6 slices of node_count u32 each):
-    // [parent_map | fn_boundary | fn_binding_name | resolved_binding | preorder_start | preorder_end]
-    // First 4 slices init to maxInt(u32), last 2 init to 0.
+    // When scope analysis provides traversal data, only 2 local slices are needed
+    // (fn_binding_name, resolved_binding). Without scope data, 6 slices are needed.
+    const local_slices_with_scope = 2;
     const slices_with_max_init = 4;
     const total_slices = 6;
 
     pub fn init(allocator: Allocator, ast: *Ast, scope: ?*scope_mod.ScopeResult) !TransformSession {
         const node_count = ast.nodes.len;
-        const block = try allocator.alloc(u32, total_slices * node_count);
-        errdefer allocator.free(block);
 
-        @memset(block[0 .. slices_with_max_init * node_count], std.math.maxInt(u32));
-        @memset(block[slices_with_max_init * node_count ..], 0);
+        // When scope analysis is available and has traversal data, borrow
+        // parent_map/preorder/fn_boundary from scope and only allocate local arrays.
+        const has_scope_traversal = if (scope) |sr| sr.traversal_parent_map.len > 0 else false;
 
-        var session = TransformSession{
-            .ast = ast,
-            .scope = scope,
-            .node_data_block = block,
-            .parent_map = @ptrCast(block[0..node_count]),
-            .function_boundary_for_node = @ptrCast(block[node_count .. 2 * node_count]),
-            .function_binding_name_node = @ptrCast(block[2 * node_count .. 3 * node_count]),
-            .resolved_binding_for_node = block[3 * node_count .. 4 * node_count],
-            .preorder_start = block[4 * node_count .. 5 * node_count],
-            .preorder_end = block[5 * node_count .. 6 * node_count],
-            .function_binding_indices = &.{},
-            .binding_occurrences = &.{},
-            .unresolved_occurrences = .empty,
-            .this_occurrences = .empty,
-        };
+        var session: TransformSession = undefined;
+
+        if (has_scope_traversal) {
+            const sr = scope.?;
+            const block = try allocator.alloc(u32, local_slices_with_scope * node_count);
+            errdefer allocator.free(block);
+            @memset(block, std.math.maxInt(u32));
+
+            session = TransformSession{
+                .ast = ast,
+                .scope = scope,
+                .node_data_block = block,
+                .parent_map = sr.traversal_parent_map,
+                .function_boundary_for_node = sr.traversal_fn_boundary,
+                .function_binding_name_node = @ptrCast(block[0..node_count]),
+                .resolved_binding_for_node = block[node_count .. 2 * node_count],
+                .preorder_start = sr.traversal_preorder_start,
+                .preorder_end = sr.traversal_preorder_end,
+                .function_binding_indices = &.{},
+                .binding_occurrences = &.{},
+                .unresolved_occurrences = .empty,
+                .this_occurrences = .empty,
+            };
+        } else {
+            const block = try allocator.alloc(u32, total_slices * node_count);
+            errdefer allocator.free(block);
+            @memset(block[0 .. slices_with_max_init * node_count], std.math.maxInt(u32));
+            @memset(block[slices_with_max_init * node_count ..], 0);
+
+            session = TransformSession{
+                .ast = ast,
+                .scope = scope,
+                .node_data_block = block,
+                .parent_map = @ptrCast(block[0..node_count]),
+                .function_boundary_for_node = @ptrCast(block[node_count .. 2 * node_count]),
+                .function_binding_name_node = @ptrCast(block[2 * node_count .. 3 * node_count]),
+                .resolved_binding_for_node = block[3 * node_count .. 4 * node_count],
+                .preorder_start = block[4 * node_count .. 5 * node_count],
+                .preorder_end = block[5 * node_count .. 6 * node_count],
+                .function_binding_indices = &.{},
+                .binding_occurrences = &.{},
+                .unresolved_occurrences = .empty,
+                .this_occurrences = .empty,
+            };
+        }
         errdefer session.deinit(allocator);
 
         try session.initBindingOccurrences(allocator);
@@ -74,7 +103,11 @@ pub const TransformSession = struct {
         const estimated_unresolved: u32 = @intCast(@max(node_count / 32, 16));
         try session.unresolved_occurrences.ensureTotalCapacity(allocator, estimated_unresolved);
 
-        try session.buildParentAndRanges(allocator);
+        if (has_scope_traversal) {
+            try session.buildOccurrencesLinear(allocator);
+        } else {
+            try session.buildParentAndRanges(allocator);
+        }
         try session.buildFunctionBindingIndices(allocator);
         return session;
     }
@@ -199,6 +232,26 @@ pub const TransformSession = struct {
             }
         }
 
+        self.sortOccurrences();
+    }
+
+    /// Linear scan for identifier/this occurrences and function binding names.
+    /// Used when scope analysis already built parent/preorder/fn_boundary.
+    fn buildOccurrencesLinear(self: *TransformSession, allocator: Allocator) Allocator.Error!void {
+        if (self.ast.nodes.len == 0) return;
+        const tags = self.ast.nodes.items(.tag);
+        for (0..tags.len) |raw| {
+            const tag = tags[raw];
+            const node: NodeIndex = @enumFromInt(raw);
+            self.recordFunctionBindingNode(node, tag);
+            if (tag == .identifier) {
+                const fn_boundary = self.function_boundary_for_node[raw];
+                const current_fn: ?NodeIndex = if (fn_boundary == .none) null else fn_boundary;
+                try self.recordIdentifierOccurrence(allocator, node, current_fn);
+            } else if (tag == .this_expr) {
+                try self.this_occurrences.append(allocator, node);
+            }
+        }
         self.sortOccurrences();
     }
 
