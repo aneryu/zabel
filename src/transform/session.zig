@@ -254,15 +254,33 @@ pub const TransformSession = struct {
             try self.this_occurrences.append(allocator, node);
         }
 
-        if (!visitor.isLeafTag(tag)) {
-            const child_function = if (isFunctionBoundary(tag)) node else current_function;
-            const children = visitor.getChildren(self.ast, node);
-            for (children.items[0..children.len]) |child| {
-                try self.visitNode(allocator, child, node, child_function, cursor);
-            }
-
-            try self.visitRange(allocator, children.range_start, children.range_end, node, child_function, cursor);
-            try self.visitRange(allocator, children.range2_start, children.range2_end, node, child_function, cursor);
+        switch (visitor.childLayout(tag)) {
+            .leaf => {},
+            .unary => {
+                const child_function = if (isFunctionBoundary(tag)) node else current_function;
+                const data = self.ast.nodes.items(.data)[raw];
+                try self.visitNode(allocator, data.unary, node, child_function, cursor);
+            },
+            .binary => {
+                const child_function = if (isFunctionBoundary(tag)) node else current_function;
+                const data = self.ast.nodes.items(.data)[raw];
+                try self.visitNode(allocator, data.binary.lhs, node, child_function, cursor);
+                try self.visitNode(allocator, data.binary.rhs, node, child_function, cursor);
+            },
+            .binary_lhs => {
+                const child_function = if (isFunctionBoundary(tag)) node else current_function;
+                const data = self.ast.nodes.items(.data)[raw];
+                try self.visitNode(allocator, data.binary.lhs, node, child_function, cursor);
+            },
+            .complex => {
+                const child_function = if (isFunctionBoundary(tag)) node else current_function;
+                const children = visitor.getChildren(self.ast, node);
+                for (children.items[0..children.len]) |child| {
+                    try self.visitNode(allocator, child, node, child_function, cursor);
+                }
+                try self.visitRange(allocator, children.range_start, children.range_end, node, child_function, cursor);
+                try self.visitRange(allocator, children.range2_start, children.range2_end, node, child_function, cursor);
+            },
         }
 
         self.preorder_end[raw] = cursor.*;

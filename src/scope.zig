@@ -684,7 +684,7 @@ const Builder = struct {
             .getter, .setter => try self.visitGetterSetter(idx, data),
 
             // ── Default: recurse into children ───────────────────────
-            else => try self.visitChildren(idx),
+            else => try self.visitChildren(idx, tag, data),
         }
     }
 
@@ -712,23 +712,31 @@ const Builder = struct {
 
     // ── Visitor Helpers ──────────────────────────────────────────────
 
-    fn visitChildren(self: *Builder, idx: NodeIndex) !void {
-        const children = visitor.getChildren(self.ast, idx);
-
-        for (children.items[0..children.len]) |child| {
-            try self.visit(child);
-        }
-
-        if (children.range_end > children.range_start) {
-            for (self.ast.extra_data.items[children.range_start..children.range_end]) |raw| {
-                try self.visit(@enumFromInt(raw));
-            }
-        }
-
-        if (children.range2_end > children.range2_start) {
-            for (self.ast.extra_data.items[children.range2_start..children.range2_end]) |raw| {
-                try self.visit(@enumFromInt(raw));
-            }
+    fn visitChildren(self: *Builder, idx: NodeIndex, tag: Node.Tag, data: Node.Data) !void {
+        switch (visitor.childLayout(tag)) {
+            .leaf => {},
+            .unary => try self.visit(data.unary),
+            .binary => {
+                try self.visit(data.binary.lhs);
+                try self.visit(data.binary.rhs);
+            },
+            .binary_lhs => try self.visit(data.binary.lhs),
+            .complex => {
+                const children = visitor.getChildren(self.ast, idx);
+                for (children.items[0..children.len]) |child| {
+                    try self.visit(child);
+                }
+                if (children.range_end > children.range_start) {
+                    for (self.ast.extra_data.items[children.range_start..children.range_end]) |raw_child| {
+                        try self.visit(@enumFromInt(raw_child));
+                    }
+                }
+                if (children.range2_end > children.range2_start) {
+                    for (self.ast.extra_data.items[children.range2_start..children.range2_end]) |raw_child| {
+                        try self.visit(@enumFromInt(raw_child));
+                    }
+                }
+            },
         }
     }
 

@@ -92,6 +92,166 @@ pub fn isLeafTag(tag: Node.Tag) bool {
     };
 }
 
+// ── Child-layout fast path ──────────────────────────────────────
+
+/// Classifies how a tag's structural children are stored, allowing
+/// callers to read children directly from the `Node.Data` union
+/// without the full `getChildren()` switch dispatch.
+pub const ChildLayout = enum {
+    /// Zero children (leaf node).
+    leaf,
+    /// Exactly one child at `data.unary`.
+    unary,
+    /// Two children at `data.binary.lhs` and `data.binary.rhs`.
+    binary,
+    /// One child at `data.binary.lhs` (rhs is a token, not a node).
+    binary_lhs,
+    /// Requires the full `getChildren()` switch.
+    complex,
+};
+
+/// Return the child-data layout for a tag.  The `leaf`, `unary`,
+/// `binary`, and `binary_lhs` results let callers skip the big
+/// `getChildren()` switch for ~60% of nodes in a typical JS file.
+pub fn childLayout(tag: Node.Tag) ChildLayout {
+    return switch (tag) {
+        // ── leaf ────────────────────────────────────────────────
+        .removed,
+        .numeric_literal,
+        .string_literal,
+        .boolean_literal,
+        .null_literal,
+        .regex_literal,
+        .bigint_literal,
+        .identifier,
+        .v8_intrinsic_identifier,
+        .this_expr,
+        .super_expr,
+        .empty_statement,
+        .debugger_statement,
+        .directive_literal,
+        .jsx_empty_expression,
+        .jsx_text,
+        .jsx_string_literal,
+        .jsx_identifier,
+        .ts_keyword_type,
+        .topic_reference,
+        .placeholder,
+        .export_default_specifier,
+        .import_default,
+        .import_namespace,
+        .ts_namespace_export_declaration,
+        .flow_number_type,
+        .flow_string_type,
+        .flow_boolean_type,
+        .flow_void_type,
+        .flow_mixed_type,
+        .flow_empty_type,
+        .flow_any_type,
+        .flow_symbol_type,
+        .flow_bigint_type,
+        .flow_null_literal_type,
+        .flow_number_literal_type,
+        .flow_string_literal_type,
+        .flow_boolean_literal_type,
+        .flow_bigint_literal_type,
+        .flow_exists_type,
+        .flow_inferred_predicate,
+        .flow_this_type_annotation,
+        .flow_variance,
+        .flow_enum_default_member,
+        => .leaf,
+
+        // ── unary (data.unary) ─────────────────────────────────
+        .unary_expr,
+        .update_expr,
+        .await_expr,
+        .yield_expr,
+        .yield_delegate_expr,
+        .spread_element,
+        .rest_element,
+        .parenthesized_expr,
+        .expression_statement,
+        .return_statement,
+        .throw_statement,
+        .ts_type_annotation,
+        .ts_array_type,
+        .ts_parenthesized_type,
+        .ts_optional_type,
+        .ts_rest_type,
+        .ts_literal_type,
+        .ts_infer_type,
+        .ts_typeof_type,
+        .ts_type_operator,
+        .ts_non_null_expression,
+        .ts_export_assignment,
+        .ts_external_module_reference,
+        .decorator,
+        .do_expression,
+        .throw_expression,
+        .export_default,
+        .class_static_block,
+        .private_name,
+        .jsx_closing_element,
+        .jsx_spread_attribute,
+        .jsx_spread_child,
+        .jsx_expression_container,
+        .flow_type_annotation,
+        .flow_nullable_type,
+        .flow_typeof_type,
+        .flow_array_type,
+        .flow_object_type_spread_property,
+        .flow_declared_predicate,
+        .flow_parenthesized_type,
+        .directive,
+        .labeled_statement,
+        .break_statement,
+        .continue_statement,
+        .ts_enum_member,
+        .meta_property,
+        .shorthand_property,
+        => .unary,
+
+        // ── binary (data.binary.lhs + data.binary.rhs) ────────
+        .binary_expr,
+        .logical_expr,
+        .assignment_expr,
+        .computed_member_expr,
+        .optional_computed_member_expr,
+        .assignment_pattern,
+        .declarator,
+        .while_statement,
+        .do_while_statement,
+        .catch_clause,
+        .with_statement,
+        .import_attribute,
+        .ts_type_reference,
+        .ts_qualified_name,
+        .ts_indexed_access_type,
+        .ts_as_expression,
+        .ts_satisfies_expression,
+        .ts_type_assertion,
+        .ts_instantiation_expression,
+        .ts_named_tuple_member,
+        .jsx_attribute,
+        .jsx_member_expression,
+        .jsx_namespaced_name,
+        .bind_expression,
+        .import_expr,
+        .property,
+        .computed_property,
+        => .binary,
+
+        // ── binary_lhs (rhs is a token) ───────────────────────
+        .member_expr,
+        .optional_chain_expr,
+        => .binary_lhs,
+
+        // ── complex (extra data, ranges, etc.) ─────────────────
+        else => .complex,
+    };
+}
+
 // ── getChildren ─────────────────────────────���────────────────────────
 
 /// Return a ChildList enumerating all direct structural children of the
