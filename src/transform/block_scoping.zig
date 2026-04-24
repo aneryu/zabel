@@ -502,12 +502,15 @@ fn nameReferencedOutsideBlock(ctx: *TransformContext, decl_node: NodeIndex, bloc
     if (func_end > ctx.ast.source.len) func_end = @intCast(ctx.ast.source.len);
 
     if (ctx.session) |session| {
-        const occurrences = session.identifierOccurrences(name) orelse return false;
-        const func_occurrence_start = lowerBoundIdentifierOccurrence(occurrences, func_start);
-        const func_occurrence_end = lowerBoundIdentifierOccurrence(occurrences, func_end);
-        const block_occurrence_start = lowerBoundIdentifierOccurrence(occurrences, block_start);
-        const block_occurrence_end = lowerBoundIdentifierOccurrence(occurrences, block_end);
-        return (func_occurrence_end - func_occurrence_start) > (block_occurrence_end - block_occurrence_start);
+        const binding_indices = session.bindingIndices(name) orelse return false;
+        var func_refs: usize = 0;
+        var block_refs: usize = 0;
+        for (binding_indices) |binding_idx| {
+            const occurrences = session.bindingOccurrences(binding_idx);
+            func_refs += lowerBoundIdentifierOccurrence(occurrences, func_end) - lowerBoundIdentifierOccurrence(occurrences, func_start);
+            block_refs += lowerBoundIdentifierOccurrence(occurrences, block_end) - lowerBoundIdentifierOccurrence(occurrences, block_start);
+        }
+        return func_refs > block_refs;
     }
 
     return false;

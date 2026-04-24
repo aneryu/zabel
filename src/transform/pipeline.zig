@@ -637,26 +637,28 @@ pub const Pipeline = struct {
         }
 
         // ── Recurse into children ────────────────────────────────────
-        const children = visitor.getChildren(ctx.ast, idx);
+        if (!visitor.isLeafTag(tag)) {
+            const children = visitor.getChildren(ctx.ast, idx);
 
-        // Direct children.
-        for (children.items[0..children.len]) |child| {
-            self.visitNode(ctx, dispatch_table, child, pass_stats, nodes_visited);
-        }
-
-        // First range.
-        if (children.range_end > children.range_start) {
-            for (ctx.ast.extra_data.items[children.range_start..children.range_end]) |raw| {
-                const child: NodeIndex = @enumFromInt(raw);
+            // Direct children.
+            for (children.items[0..children.len]) |child| {
                 self.visitNode(ctx, dispatch_table, child, pass_stats, nodes_visited);
             }
-        }
 
-        // Second range.
-        if (children.range2_end > children.range2_start) {
-            for (ctx.ast.extra_data.items[children.range2_start..children.range2_end]) |raw| {
-                const child: NodeIndex = @enumFromInt(raw);
-                self.visitNode(ctx, dispatch_table, child, pass_stats, nodes_visited);
+            // First range.
+            if (children.range_end > children.range_start) {
+                for (ctx.ast.extra_data.items[children.range_start..children.range_end]) |raw| {
+                    const child: NodeIndex = @enumFromInt(raw);
+                    self.visitNode(ctx, dispatch_table, child, pass_stats, nodes_visited);
+                }
+            }
+
+            // Second range.
+            if (children.range2_end > children.range2_start) {
+                for (ctx.ast.extra_data.items[children.range2_start..children.range2_end]) |raw| {
+                    const child: NodeIndex = @enumFromInt(raw);
+                    self.visitNode(ctx, dispatch_table, child, pass_stats, nodes_visited);
+                }
             }
         }
 

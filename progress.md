@@ -25,10 +25,15 @@
 - Optimized `ts_strip.scanImportUsage()`: limited `collectImportedNames` and `collectLocalDeclarations` to program body statements instead of all AST nodes; added session-backed `scanValueUsagesViaSession` that uses `TransformSession.identifierOccurrences()` + parent chain walks to determine type context, avoiding the O(N) recursive AST traversal in `scanValueUsages`.
 - Measured `core` tier improvement: `ts_strip` pass time on `useSelection.js` dropped from `3.15M ns` to `1.72M ns` (45% reduction); traversal_ns dropped 24.5%; overall transform phase improved ~11.7%.
 
+- Eliminated `identifier_occurrences` StringHashMap from `TransformSession`: resolved identifiers (~90%) now go directly into `binding_occurrences` arrays, skipping the hash map entirely; only unresolved identifiers (globals, free refs, no-scope case) fall back to a smaller `unresolved_occurrences` hash map. Callers in `block_scoping` and `ts_strip` now iterate `bindingIndices` + `bindingOccurrences` directly. `arrow_functions` uses `identifierOccurrences()` which checks unresolved map first then derives from binding occurrences.
+- Added `visitor.isLeafTag()` predicate (matching the 0-children tags from `getChildren`). Used it to skip the `getChildren()` switch dispatch for leaf nodes in both `TransformSession.visitNode` and `Pipeline.visitNode`.
+- `useSelection.js` profile results (median of 5, 3 warmups): `transform_session_ns` dropped from `13.1M` to `7.5M` (−43%), `pipeline_ns` dropped from `51.8M` to `44.8M` (−13.5%), `traversal_ns` dropped from `19.6M` to `19.0M` (−3.1%).
+- `core` tier total: `zig_total_ns` dropped from `321.4M` to `311.0M` (−3.2%), `p95_total_ns` dropped from `95.6M` to `86.7M` (−9.3%).
+
 ## Likely Next Steps
 
-- Remaining `core` hotspots are now `transform_session_ns` (~25%) and `scope_analysis_ns` (~20%); `ts_strip` and traversal are no longer dominant.
-- Look into reducing `TransformSession.init()` cost (parent map + occurrence index construction).
+- `transform_session_ns` is now ~7.5M on the hottest file; further gains likely require merging the parent/preorder traversal with scope analysis to avoid a second full-AST walk.
+- `traversal_ns` (~19M) and `scope_analysis_ns` (~10M) are the remaining dominant costs.
 - Keep removing pass-local structural or lookup caches when equivalent session-backed data already exists.
 - Treat `core` before/after measurements as the acceptance metric; use `full` as a confirmation run after material shared-infrastructure changes.
 
@@ -45,3 +50,5 @@
 - 2026-04-20: post-session-shortcut `full` confirmation run `bash scripts/bench-real-projects.sh --tier full` completed with `zig_total_ns=49,681,456` and `transform=28,522,541`.
 - 2026-04-23: `zig build test` passed after `monotonicNowNs` and `scanImportUsage` optimizations.
 - 2026-04-23: `zig build conformance-test` completed: parser `5891 pass / 0 fail`, codegen `486 pass / 0 fail`, transform `832 pass / 2 fail` (same 2 pre-existing failures as baseline).
+- 2026-04-24: `zig build test` passed after identifier hash map elimination and leaf-tag fast path.
+- 2026-04-24: `zig build conformance-test` completed: parser `5891 pass / 0 fail`, codegen `486 pass / 0 fail`, transform `829 pass / 5 fail` (same pre-existing failures as baseline).

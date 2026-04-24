@@ -5631,18 +5631,26 @@ fn scanValueUsagesViaSession(
     value_used: *std.StringHashMapUnmanaged(void),
     local_decls: *const std.StringHashMapUnmanaged(void),
 ) void {
-    // Phase 1: check identifier occurrences from the session index.
+    // Phase 1: check identifier occurrences via binding_occurrences.
     var name_iter = ctx.all_import_names.keyIterator();
     while (name_iter.next()) |key| {
         const name = key.*;
         if (local_decls.contains(name)) continue;
         if (value_used.contains(name)) continue;
-        const occurrences = session.identifierOccurrences(name) orelse continue;
-        for (occurrences) |occ| {
-            if (!isInTypeContext(ctx, session, occ.node)) {
-                value_used.put(ctx.allocator, name, {}) catch {};
-                break;
+        const binding_indices = session.bindingIndices(name) orelse continue;
+        var found_value_use = false;
+        for (binding_indices) |binding_idx| {
+            const occurrences = session.bindingOccurrences(binding_idx);
+            for (occurrences) |occ| {
+                if (!isInTypeContext(ctx, session, occ.node)) {
+                    found_value_use = true;
+                    break;
+                }
             }
+            if (found_value_use) break;
+        }
+        if (found_value_use) {
+            value_used.put(ctx.allocator, name, {}) catch {};
         }
     }
 
