@@ -44,10 +44,16 @@
 - Optimized `Pipeline.visitNode` exit dispatch: skip exit-tag re-read when no enter passes were registered for the tag; inline dispatch range checks to avoid function-call overhead on empty ranges.
 - `core` tier A/B (10 iterations, interleaved): baseline `588.5M ns` → optimized `576.7M ns` (−2.0%). Pipeline_ns on `InternalTable.js` improved ~7.8%, `AnimatedValue.js` ~8.4%.
 
+- Added `exit_filter` to `Pass` struct, allowing passes to register a narrower tag set for exit dispatch separately from the enter filter. Updated `buildDispatchTable` to use `exit_filter` when present.
+- ts_strip: set exit_filter to only `.program` + `.ts_module_declaration` (the only tags the exit handler uses), eliminating ~99.9% of exit dispatch calls (7700 → 5 on `useSelection.js`).
+- ts_strip: bulk-clear dense TS side tables (`type_annotations`, `return_types`, `type_parameters`, `ts_optional_params`) during `.program` enter, removing 11 high-frequency tags from the node filter (identifier, rest_element, patterns, call_expr, etc.). Enter calls dropped ~76% (7700 → 1790 on `useSelection.js`).
+- `core` tier A/B (10 iterations, interleaved): baseline `172.8M ns` → optimized `165.2M ns` (−4.4%). `ts_strip` total_ns on `useSelection.js` improved ~19.8%, `traversal_ns` improved ~19.8%, `pipeline_ns` improved ~9.5%.
+
 ## Likely Next Steps
 
-- `scope_analysis_ns` (~9.5M) is still significant; the `findVisibleBindingIndex` hash lookup + scope-chain walk for each identifier is the per-node bottleneck — a name→binding cache updated on scope push/pop could eliminate many repeated lookups.
-- Merging the parent/preorder traversal into scope analysis would eliminate the second full-AST walk, saving ~7M ns, but requires coupling scope analysis to TransformSession data structures.
+- `scope_analysis_ns` (~8.5M) is still significant; the `findVisibleBindingIndex` hash lookup + scope-chain walk for each identifier is the per-node bottleneck — a name→binding cache updated on scope push/pop could eliminate many repeated lookups.
+- Merging the parent/preorder traversal into scope analysis would eliminate the second full-AST walk, saving ~5-7M ns, but requires coupling scope analysis to TransformSession data structures.
+- Apply `exit_filter` to other passes that have broad enter filters but narrow exit behavior.
 - Keep removing pass-local structural or lookup caches when equivalent session-backed data already exists.
 - Treat `core` before/after measurements as the acceptance metric; use `full` as a confirmation run after material shared-infrastructure changes.
 
@@ -71,4 +77,6 @@
 - 2026-04-24: `zig build test` passed after scope analysis leaf-tag fast path, DenseNodeMap consolidation, and containing_fn_scope pre-computation.
 - 2026-04-24: `zig build conformance-test` completed: transform `829 pass / 5 fail` (same pre-existing failures).
 - 2026-04-24: `zig build test` passed after childLayout fast path in Pipeline, TransformSession, and scope analysis.
+- 2026-04-24: `zig build conformance-test` completed: parser `5891 pass / 0 fail`, codegen `486 pass / 0 fail`, transform `832 pass / 2 fail` (same 2 pre-existing failures).
+- 2026-04-24: `zig build test` passed after ts_strip dispatch optimization (exit_filter + bulk side-table clear).
 - 2026-04-24: `zig build conformance-test` completed: parser `5891 pass / 0 fail`, codegen `486 pass / 0 fail`, transform `832 pass / 2 fail` (same 2 pre-existing failures).

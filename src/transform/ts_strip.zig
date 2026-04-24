@@ -61,7 +61,10 @@ pub fn createPass(config: TsStripConfig) Pass {
     // G) Import handling — strip type specifiers from regular imports
     filter.set(@intFromEnum(Node.Tag.import_declaration));
 
-    // H) Side table cleanup for functions, classes, params, etc.
+    // H) Side table cleanup for functions, classes, etc.
+    //    (identifier, rest_element, assignment_pattern, object_pattern,
+    //     array_pattern, declarator are handled via bulk side-table clear
+    //     in the .program enter handler below.)
     filter.set(@intFromEnum(Node.Tag.function_declaration));
     filter.set(@intFromEnum(Node.Tag.async_function_declaration));
     filter.set(@intFromEnum(Node.Tag.generator_declaration));
@@ -79,11 +82,6 @@ pub fn createPass(config: TsStripConfig) Pass {
     filter.set(@intFromEnum(Node.Tag.setter));
     filter.set(@intFromEnum(Node.Tag.computed_method));
     filter.set(@intFromEnum(Node.Tag.declarator));
-    filter.set(@intFromEnum(Node.Tag.identifier));
-    filter.set(@intFromEnum(Node.Tag.rest_element));
-    filter.set(@intFromEnum(Node.Tag.assignment_pattern));
-    filter.set(@intFromEnum(Node.Tag.object_pattern));
-    filter.set(@intFromEnum(Node.Tag.array_pattern));
 
     // I) TS parameter property — replace with inner parameter
     filter.set(@intFromEnum(Node.Tag.ts_parameter_property));
@@ -92,14 +90,6 @@ pub fn createPass(config: TsStripConfig) Pass {
     filter.set(@intFromEnum(Node.Tag.ts_enum_declaration));
     filter.set(@intFromEnum(Node.Tag.member_expr));
     filter.set(@intFromEnum(Node.Tag.computed_member_expr));
-
-    // M) Side table cleanup for call/new/tagged-template/JSX (type arguments)
-    filter.set(@intFromEnum(Node.Tag.call_expr));
-    filter.set(@intFromEnum(Node.Tag.new_expr));
-    filter.set(@intFromEnum(Node.Tag.optional_call_expr));
-    filter.set(@intFromEnum(Node.Tag.tagged_template_expr));
-    filter.set(@intFromEnum(Node.Tag.jsx_opening_element));
-    filter.set(@intFromEnum(Node.Tag.jsx_self_closing_element));
 
     // N) export_all — handle `export type * from` removal
     filter.set(@intFromEnum(Node.Tag.export_all));
@@ -112,9 +102,15 @@ pub fn createPass(config: TsStripConfig) Pass {
     filter.set(@intFromEnum(Node.Tag.ts_export_assignment));
     filter.set(@intFromEnum(Node.Tag.ts_namespace_export_declaration));
 
+    // Exit filter — exitNode only handles .program and .ts_module_declaration.
+    var ef = visitor.NodeTagBitSet.initEmpty();
+    ef.set(@intFromEnum(Node.Tag.program));
+    ef.set(@intFromEnum(Node.Tag.ts_module_declaration));
+
     return .{
         .name = "ts_strip",
         .node_filter = filter,
+        .exit_filter = ef,
         .enter = enterNode,
         .exit = exitNode,
         .priority = 10,
@@ -131,6 +127,10 @@ fn enterNode(idx: NodeIndex, ctx: *TransformContext) visitor.VisitResult {
         .program => {
             scanImportUsage(ctx);
             ctx.had_ts_strip_pass = true;
+            // Bulk-clear dense TS side tables so per-node removes for
+            // identifiers, declarators, patterns, and call-sites are
+            // unnecessary (those tags are no longer in node_filter).
+            bulkClearTsSideTables(ctx);
             return .continue_traversal;
         },
 
@@ -286,24 +286,19 @@ fn enterNode(idx: NodeIndex, ctx: *TransformContext) visitor.VisitResult {
         },
 
         .declarator => {
-            _ = ctx.ast.type_annotations.remove(@intFromEnum(idx));
-            _ = ctx.ast.ts_optional_params.remove(@intFromEnum(idx));
-            // Remove definite assignment assertion (!)
+            // type_annotations and ts_optional_params already bulk-cleared;
+            // only ts_class_modifiers (definite !) needs per-node removal.
             _ = ctx.ast.ts_class_modifiers.remove(@intFromEnum(idx));
             return .continue_traversal;
         },
 
-        .identifier,
-        .rest_element,
-        .assignment_pattern,
-        .object_pattern,
-        .array_pattern,
-        => {
-            // Just clean type annotations from parameters/variables
-            _ = ctx.ast.type_annotations.remove(@intFromEnum(idx));
-            _ = ctx.ast.ts_optional_params.remove(@intFromEnum(idx));
-            return .continue_traversal;
-        },
+        // Note: .identifier, .rest_element, .assignment_pattern,
+        // .object_pattern, .array_pattern are no longer in node_filter — their
+        // side-table entries (type_annotations, ts_optional_params) are cleared
+        // in bulk during the .program enter handler.
+        // .call_expr, .new_expr, .optional_call_expr, .tagged_template_expr,
+        // .jsx_opening_element, .jsx_self_closing_element are also removed —
+        // type_parameters is bulk-cleared.
 
         // ────────────────────────────────────────────────────────────
         // I) TS parameter property — replace with inner param
@@ -355,21 +350,6 @@ fn enterNode(idx: NodeIndex, ctx: *TransformContext) visitor.VisitResult {
         // L) TS index signature — remove from class body
         // ────────────────────────────────────────────────────────────
         .ts_index_signature => return .remove_node,
-
-        // ────────────────────────────────────────────────────────────
-        // M) Side table cleanup for call/new/tagged-template/JSX
-        //    (remove type arguments from expressions)
-        // ────────────────────────────────────────────────────────────
-        .call_expr,
-        .new_expr,
-        .optional_call_expr,
-        .tagged_template_expr,
-        .jsx_opening_element,
-        .jsx_self_closing_element,
-        => {
-            _ = ctx.ast.type_parameters.remove(@intFromEnum(idx));
-            return .continue_traversal;
-        },
 
         // ────────────────────────────────────────────────────────────
         // N) export_all — remove `export type * from` entirely
@@ -675,6 +655,17 @@ fn cleanSideTables(ctx: *TransformContext, idx: NodeIndex) void {
     _ = ctx.ast.return_types.remove(id);
     _ = ctx.ast.type_parameters.remove(id);
     _ = ctx.ast.ts_optional_params.remove(id);
+}
+
+/// One-shot clear of the four dense TS side tables.  Called once during
+/// the .program enter so that high-frequency tags (identifier,
+/// rest_element, patterns, call_expr, etc.) no longer need per-node
+/// dispatch just to remove entries from these tables.
+fn bulkClearTsSideTables(ctx: *TransformContext) void {
+    ctx.ast.type_annotations.clearRetainingCapacity();
+    ctx.ast.return_types.clearRetainingCapacity();
+    ctx.ast.type_parameters.clearRetainingCapacity();
+    ctx.ast.ts_optional_params.clearRetainingCapacity();
 }
 
 fn isTsTypeDeclaration(tag: Node.Tag) bool {
