@@ -23,6 +23,7 @@ pub const IdentifierOccurrence = struct {
 pub const TransformSession = struct {
     ast: *const Ast,
     scope: ?*scope_mod.ScopeResult,
+    node_data_block: []u32,
     parent_map: []NodeIndex,
     preorder_start: []u32,
     preorder_end: []u32,
@@ -34,17 +35,30 @@ pub const TransformSession = struct {
     identifier_occurrences: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(IdentifierOccurrence)),
     this_occurrences: std.ArrayListUnmanaged(NodeIndex),
 
+    // Consolidated block layout (6 slices of node_count u32 each):
+    // [parent_map | fn_boundary | fn_binding_name | resolved_binding | preorder_start | preorder_end]
+    // First 4 slices init to maxInt(u32), last 2 init to 0.
+    const slices_with_max_init = 4;
+    const total_slices = 6;
+
     pub fn init(allocator: Allocator, ast: *Ast, scope: ?*scope_mod.ScopeResult) !TransformSession {
         const node_count = ast.nodes.len;
+        const block = try allocator.alloc(u32, total_slices * node_count);
+        errdefer allocator.free(block);
+
+        @memset(block[0 .. slices_with_max_init * node_count], std.math.maxInt(u32));
+        @memset(block[slices_with_max_init * node_count ..], 0);
+
         var session = TransformSession{
             .ast = ast,
             .scope = scope,
-            .parent_map = try allocator.alloc(NodeIndex, node_count),
-            .preorder_start = try allocator.alloc(u32, node_count),
-            .preorder_end = try allocator.alloc(u32, node_count),
-            .function_boundary_for_node = try allocator.alloc(NodeIndex, node_count),
-            .function_binding_name_node = try allocator.alloc(NodeIndex, node_count),
-            .resolved_binding_for_node = try allocator.alloc(u32, node_count),
+            .node_data_block = block,
+            .parent_map = @ptrCast(block[0..node_count]),
+            .function_boundary_for_node = @ptrCast(block[node_count .. 2 * node_count]),
+            .function_binding_name_node = @ptrCast(block[2 * node_count .. 3 * node_count]),
+            .resolved_binding_for_node = block[3 * node_count .. 4 * node_count],
+            .preorder_start = block[4 * node_count .. 5 * node_count],
+            .preorder_end = block[5 * node_count .. 6 * node_count],
             .function_binding_indices = &.{},
             .binding_occurrences = &.{},
             .identifier_occurrences = .empty,
@@ -52,13 +66,11 @@ pub const TransformSession = struct {
         };
         errdefer session.deinit(allocator);
 
-        @memset(session.parent_map, .none);
-        @memset(session.preorder_start, 0);
-        @memset(session.preorder_end, 0);
-        @memset(session.function_boundary_for_node, .none);
-        @memset(session.function_binding_name_node, .none);
-        @memset(session.resolved_binding_for_node, resolved_binding_none);
         try session.initBindingOccurrences(allocator);
+
+        // Pre-size identifier_occurrences to reduce rehashing during traversal.
+        const estimated_unique_ids: u32 = @intCast(@max(node_count / 8, 16));
+        try session.identifier_occurrences.ensureTotalCapacity(allocator, estimated_unique_ids);
 
         try session.buildParentAndRanges(allocator);
         try session.buildFunctionBindingIndices(allocator);
@@ -84,12 +96,7 @@ pub const TransformSession = struct {
             occurrences.deinit(allocator);
         }
         if (self.binding_occurrences.len > 0) allocator.free(self.binding_occurrences);
-        allocator.free(self.parent_map);
-        allocator.free(self.preorder_start);
-        allocator.free(self.preorder_end);
-        allocator.free(self.function_boundary_for_node);
-        allocator.free(self.function_binding_name_node);
-        allocator.free(self.resolved_binding_for_node);
+        allocator.free(self.node_data_block);
         self.* = undefined;
     }
 
