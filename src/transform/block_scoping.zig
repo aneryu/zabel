@@ -492,14 +492,23 @@ fn nameReferencedOutsideBlock(ctx: *TransformContext, decl_node: NodeIndex, bloc
     if (func_end > ctx.ast.source.len) func_end = @intCast(ctx.ast.source.len);
 
     if (ctx.session) |session| {
-        const binding_indices = session.bindingIndices(name) orelse return false;
         var func_refs: usize = 0;
         var block_refs: usize = 0;
-        for (binding_indices) |binding_idx| {
-            const occurrences = session.bindingOccurrences(binding_idx);
-            func_refs += lowerBoundIdentifierOccurrence(occurrences, func_end) - lowerBoundIdentifierOccurrence(occurrences, func_start);
-            block_refs += lowerBoundIdentifierOccurrence(occurrences, block_end) - lowerBoundIdentifierOccurrence(occurrences, block_start);
+
+        // Count resolved binding occurrences.
+        if (session.bindingIndices(name)) |binding_indices| {
+            for (binding_indices) |binding_idx| {
+                const occurrences = session.bindingOccurrences(binding_idx);
+                func_refs += lowerBoundIdentifierOccurrence(occurrences, func_end) - lowerBoundIdentifierOccurrence(occurrences, func_start);
+                block_refs += lowerBoundIdentifierOccurrence(occurrences, block_end) - lowerBoundIdentifierOccurrence(occurrences, block_start);
+            }
         }
+
+        // Count unresolved (free) references — e.g. `a` in `{ a; } { let a; }`.
+        const unresolved = session.unresolvedOccurrences(name);
+        func_refs += lowerBoundIdentifierOccurrence(unresolved, func_end) - lowerBoundIdentifierOccurrence(unresolved, func_start);
+        block_refs += lowerBoundIdentifierOccurrence(unresolved, block_end) - lowerBoundIdentifierOccurrence(unresolved, block_start);
+
         return func_refs > block_refs;
     }
 

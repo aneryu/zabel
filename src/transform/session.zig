@@ -159,6 +159,11 @@ pub const TransformSession = struct {
         return self.binding_occurrences[binding_idx].items;
     }
 
+    pub fn unresolvedOccurrences(self: *const TransformSession, name: []const u8) []const IdentifierOccurrence {
+        const occs = self.unresolved_occurrences.get(name) orelse return &.{};
+        return occs.items;
+    }
+
     pub fn resolvedBindingIndexFor(self: *const TransformSession, node: NodeIndex) ?u32 {
         const raw = @intFromEnum(node);
         if (raw >= self.resolved_binding_for_node.len) return null;
