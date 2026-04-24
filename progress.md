@@ -24,11 +24,16 @@
 - Replaced `std.c.clock_gettime` in `monotonicNowNs()` with `std.os.linux.clock_gettime` to remove libc dependency from the transform pipeline, allowing benchmarks and tests to compile without linking libc.
 - Optimized `ts_strip.scanImportUsage()`: limited `collectImportedNames` and `collectLocalDeclarations` to program body statements instead of all AST nodes; added session-backed `scanValueUsagesViaSession` that uses `TransformSession.identifierOccurrences()` + parent chain walks to determine type context, avoiding the O(N) recursive AST traversal in `scanValueUsages`.
 - Measured `core` tier improvement: `ts_strip` pass time on `useSelection.js` dropped from `3.15M ns` to `1.72M ns` (45% reduction); traversal_ns dropped 24.5%; overall transform phase improved ~11.7%.
+- Consolidated `TransformSession.init()` from 6 separate `allocator.alloc(node_count)` + 6 `@memset` calls into a single allocation with 2 memset passes. Added `node_data_block` field; `deinit` frees one block instead of six.
+- Consolidated scope analysis `DenseNodeMap` allocations (`node_to_scope` + `node_to_binding`) into a single block with ownership transfer to `ScopeResult` via `dense_map_block` field.
+- Pre-sized `identifier_occurrences` hash map with `ensureTotalCapacity(node_count/8)` to reduce rehashing during the `buildParentAndRanges` traversal.
+- Measured `transform_session_ns` improvement on `useSelection.js`: median 2.39M ns (down from 2.58M ns baseline, ~7.5% reduction). `scope_analysis_ns` also showed a small reduction (~2.3%).
 
 ## Likely Next Steps
 
-- Remaining `core` hotspots are now `transform_session_ns` (~25%) and `scope_analysis_ns` (~20%); `ts_strip` and traversal are no longer dominant.
-- Look into reducing `TransformSession.init()` cost (parent map + occurrence index construction).
+- `transform_session_ns` (~25%) and `scope_analysis_ns` (~20%) remain the dominant shared-overhead hotspots; allocation consolidation yielded a ~7.5% reduction in `transform_session_ns` on `useSelection.js`, but the bulk of the cost is the recursive `buildParentAndRanges` traversal itself and identifier occurrence hash map operations.
+- An iterative-stack conversion of `buildParentAndRanges` was attempted and reverted — explicit stack management overhead outweighed call-frame savings.
+- Further `TransformSession` gains likely require structural changes: merging the parent/preorder traversal with scope analysis to avoid a second full-AST walk, or using token-index–based occurrence grouping to reduce hash pressure.
 - Keep removing pass-local structural or lookup caches when equivalent session-backed data already exists.
 - Treat `core` before/after measurements as the acceptance metric; use `full` as a confirmation run after material shared-infrastructure changes.
 
@@ -45,3 +50,5 @@
 - 2026-04-20: post-session-shortcut `full` confirmation run `bash scripts/bench-real-projects.sh --tier full` completed with `zig_total_ns=49,681,456` and `transform=28,522,541`.
 - 2026-04-23: `zig build test` passed after `monotonicNowNs` and `scanImportUsage` optimizations.
 - 2026-04-23: `zig build conformance-test` completed: parser `5891 pass / 0 fail`, codegen `486 pass / 0 fail`, transform `832 pass / 2 fail` (same 2 pre-existing failures as baseline).
+- 2026-04-24: `zig build test` passed after allocation consolidation and hash map pre-sizing.
+- 2026-04-24: `zig build conformance-test` completed: parser `5891 pass / 0 fail`, codegen `486 pass / 0 fail`, transform `832 pass / 2 fail` (same 2 pre-existing failures).

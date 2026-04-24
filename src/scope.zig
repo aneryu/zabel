@@ -139,6 +139,7 @@ pub const ScopeResult = struct {
     binding_name_indices: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(u32)),
     node_to_scope: DenseNodeMap(ScopeIndex),
     node_to_binding: DenseNodeMap(u32),
+    dense_map_block: []u32 = &.{},
     allocator: Allocator,
 
     pub fn deinit(self: *ScopeResult) void {
@@ -151,8 +152,12 @@ pub const ScopeResult = struct {
             indices.deinit(self.allocator);
         }
         self.binding_name_indices.deinit(self.allocator);
-        self.node_to_scope.deinit(self.allocator);
-        self.node_to_binding.deinit(self.allocator);
+        if (self.dense_map_block.len > 0) {
+            self.allocator.free(self.dense_map_block);
+        } else {
+            self.node_to_scope.deinit(self.allocator);
+            self.node_to_binding.deinit(self.allocator);
+        }
     }
 };
 
@@ -182,6 +187,8 @@ pub fn analyzeWithOptions(ast: *const Ast, allocator: Allocator, options: Analyz
     builder.node_to_scope = .{};
     const node_to_binding = builder.node_to_binding;
     builder.node_to_binding = .{};
+    const dense_map_block = builder.dense_map_block;
+    builder.dense_map_block = &.{};
     return ScopeResult{
         .scopes = scopes,
         .bindings = bindings,
@@ -190,6 +197,7 @@ pub fn analyzeWithOptions(ast: *const Ast, allocator: Allocator, options: Analyz
         .binding_name_indices = binding_name_indices,
         .node_to_scope = node_to_scope,
         .node_to_binding = node_to_binding,
+        .dense_map_block = dense_map_block,
         .allocator = allocator,
     };
 }
@@ -352,6 +360,7 @@ const Builder = struct {
     binding_name_indices: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(u32)),
     node_to_scope: DenseNodeMap(ScopeIndex),
     node_to_binding: DenseNodeMap(u32),
+    dense_map_block: []u32 = &.{},
     /// Stack of scope indices during traversal
     scope_stack: std.ArrayListUnmanaged(ScopeIndex),
     options: AnalyzeOptions,
@@ -383,8 +392,12 @@ const Builder = struct {
             indices.deinit(self.allocator);
         }
         self.binding_name_indices.deinit(self.allocator);
-        self.node_to_scope.deinit(self.allocator);
-        self.node_to_binding.deinit(self.allocator);
+        if (self.dense_map_block.len > 0) {
+            self.allocator.free(self.dense_map_block);
+        } else {
+            self.node_to_scope.deinit(self.allocator);
+            self.node_to_binding.deinit(self.allocator);
+        }
         self.scope_stack.deinit(self.allocator);
     }
 
@@ -418,8 +431,12 @@ const Builder = struct {
 
     fn run(self: *Builder) !void {
         if (self.ast.nodes.len == 0) return;
-        try self.node_to_scope.ensureNodeCount(self.allocator, self.ast.nodes.items(.tag).len);
-        try self.node_to_binding.ensureNodeCount(self.allocator, self.ast.nodes.items(.tag).len);
+        const node_count = self.ast.nodes.items(.tag).len;
+        const block = try self.allocator.alloc(u32, 2 * node_count);
+        @memset(block, dense_node_map_none);
+        self.dense_map_block = block;
+        self.node_to_scope.values = block[0..node_count];
+        self.node_to_binding.values = block[node_count..];
 
         // Create root scope
         const root_kind: ScopeKind = if (self.ast.source_type == .module) .module else .global;
