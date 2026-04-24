@@ -302,18 +302,24 @@ test "transform session exposes resolved binding indices for identifier nodes" {
     const all_bindings = session.bindingIndices("value") orelse return error.ExpectedBindings;
     try std.testing.expectEqual(@as(usize, 3), all_bindings.len);
 
-    const occurrences = session.identifierOccurrences("value") orelse return error.ExpectedOccurrences;
-    try std.testing.expectEqual(@as(usize, 5), occurrences.len);
-
     const global_binding = all_bindings[0];
     const outer_binding = all_bindings[1];
     const inner_binding = all_bindings[2];
 
-    try std.testing.expectEqual(global_binding, session.resolvedBindingIndexFor(occurrences[0].node).?);
-    try std.testing.expectEqual(outer_binding, session.resolvedBindingIndexFor(occurrences[1].node).?);
-    try std.testing.expectEqual(outer_binding, session.resolvedBindingIndexFor(occurrences[2].node).?);
-    try std.testing.expectEqual(inner_binding, session.resolvedBindingIndexFor(occurrences[3].node).?);
-    try std.testing.expectEqual(inner_binding, session.resolvedBindingIndexFor(occurrences[4].node).?);
+    // Verify per-binding occurrence counts: global=1, outer=2, inner=2 (total 5).
+    const global_occs = session.bindingOccurrences(global_binding);
+    const outer_occs = session.bindingOccurrences(outer_binding);
+    const inner_occs = session.bindingOccurrences(inner_binding);
+    try std.testing.expectEqual(@as(usize, 1), global_occs.len);
+    try std.testing.expectEqual(@as(usize, 2), outer_occs.len);
+    try std.testing.expectEqual(@as(usize, 2), inner_occs.len);
+
+    // Verify resolved binding indices via each occurrence's node.
+    try std.testing.expectEqual(global_binding, session.resolvedBindingIndexFor(global_occs[0].node).?);
+    try std.testing.expectEqual(outer_binding, session.resolvedBindingIndexFor(outer_occs[0].node).?);
+    try std.testing.expectEqual(outer_binding, session.resolvedBindingIndexFor(outer_occs[1].node).?);
+    try std.testing.expectEqual(inner_binding, session.resolvedBindingIndexFor(inner_occs[0].node).?);
+    try std.testing.expectEqual(inner_binding, session.resolvedBindingIndexFor(inner_occs[1].node).?);
 }
 
 test "transform session indexes this expressions in source order" {

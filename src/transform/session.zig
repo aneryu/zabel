@@ -32,7 +32,9 @@ pub const TransformSession = struct {
     resolved_binding_for_node: []u32,
     function_binding_indices: []FunctionBindingIndexMap,
     binding_occurrences: []std.ArrayListUnmanaged(IdentifierOccurrence),
-    identifier_occurrences: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(IdentifierOccurrence)),
+    /// Occurrences for identifiers that did not resolve to any binding
+    /// (globals, free references, or when scope analysis is absent).
+    unresolved_occurrences: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(IdentifierOccurrence)),
     this_occurrences: std.ArrayListUnmanaged(NodeIndex),
 
     // Consolidated block layout (6 slices of node_count u32 each):
@@ -61,16 +63,16 @@ pub const TransformSession = struct {
             .preorder_end = block[5 * node_count .. 6 * node_count],
             .function_binding_indices = &.{},
             .binding_occurrences = &.{},
-            .identifier_occurrences = .empty,
+            .unresolved_occurrences = .empty,
             .this_occurrences = .empty,
         };
         errdefer session.deinit(allocator);
 
         try session.initBindingOccurrences(allocator);
 
-        // Pre-size identifier_occurrences to reduce rehashing during traversal.
-        const estimated_unique_ids: u32 = @intCast(@max(node_count / 8, 16));
-        try session.identifier_occurrences.ensureTotalCapacity(allocator, estimated_unique_ids);
+        // Pre-size unresolved_occurrences to reduce rehashing during traversal.
+        const estimated_unresolved: u32 = @intCast(@max(node_count / 32, 16));
+        try session.unresolved_occurrences.ensureTotalCapacity(allocator, estimated_unresolved);
 
         try session.buildParentAndRanges(allocator);
         try session.buildFunctionBindingIndices(allocator);
@@ -78,11 +80,11 @@ pub const TransformSession = struct {
     }
 
     pub fn deinit(self: *TransformSession, allocator: Allocator) void {
-        var occurrence_iter = self.identifier_occurrences.valueIterator();
-        while (occurrence_iter.next()) |occurrences| {
+        var unresolved_iter = self.unresolved_occurrences.valueIterator();
+        while (unresolved_iter.next()) |occurrences| {
             occurrences.deinit(allocator);
         }
-        self.identifier_occurrences.deinit(allocator);
+        self.unresolved_occurrences.deinit(allocator);
         self.this_occurrences.deinit(allocator);
         for (self.function_binding_indices) |*map| {
             var binding_iter = map.valueIterator();
@@ -126,8 +128,20 @@ pub const TransformSession = struct {
     }
 
     pub fn identifierOccurrences(self: *const TransformSession, name: []const u8) ?[]const IdentifierOccurrence {
-        const occurrences = self.identifier_occurrences.get(name) orelse return null;
-        return occurrences.items;
+        // Check unresolved occurrences first (no-scope case, globals, free refs).
+        if (self.unresolved_occurrences.get(name)) |occs| {
+            if (occs.items.len > 0) return occs.items;
+        }
+        // Derive from binding_occurrences via scope's binding_name_indices.
+        const scope = self.scope orelse return null;
+        const binding_indices = scope.binding_name_indices.get(name) orelse return null;
+        for (binding_indices.items) |idx| {
+            if (idx < self.binding_occurrences.len) {
+                const items = self.binding_occurrences[idx].items;
+                if (items.len > 0) return items;
+            }
+        }
+        return null;
     }
 
     pub fn thisOccurrences(self: *const TransformSession) []const NodeIndex {
@@ -143,6 +157,11 @@ pub const TransformSession = struct {
     pub fn bindingOccurrences(self: *const TransformSession, binding_idx: u32) []const IdentifierOccurrence {
         if (binding_idx >= self.binding_occurrences.len) return &.{};
         return self.binding_occurrences[binding_idx].items;
+    }
+
+    pub fn unresolvedOccurrences(self: *const TransformSession, name: []const u8) []const IdentifierOccurrence {
+        const occs = self.unresolved_occurrences.get(name) orelse return &.{};
+        return occs.items;
     }
 
     pub fn resolvedBindingIndexFor(self: *const TransformSession, node: NodeIndex) ?u32 {
@@ -195,7 +214,7 @@ pub const TransformSession = struct {
         for (self.function_binding_indices) |*map| map.* = .{};
 
         for (scope.bindings, 0..) |binding, binding_idx| {
-            const owner_scope_idx = containingFunctionScope(scope, binding.scope);
+            const owner_scope_idx = scope.containingFunctionScope(binding.scope);
             const owner_scope_i = @intFromEnum(owner_scope_idx);
             if (owner_scope_i >= self.function_binding_indices.len) continue;
 
@@ -235,14 +254,16 @@ pub const TransformSession = struct {
             try self.this_occurrences.append(allocator, node);
         }
 
-        const child_function = if (isFunctionBoundary(tag)) node else current_function;
-        const children = visitor.getChildren(self.ast, node);
-        for (children.items[0..children.len]) |child| {
-            try self.visitNode(allocator, child, node, child_function, cursor);
-        }
+        if (!visitor.isLeafTag(tag)) {
+            const child_function = if (isFunctionBoundary(tag)) node else current_function;
+            const children = visitor.getChildren(self.ast, node);
+            for (children.items[0..children.len]) |child| {
+                try self.visitNode(allocator, child, node, child_function, cursor);
+            }
 
-        try self.visitRange(allocator, children.range_start, children.range_end, node, child_function, cursor);
-        try self.visitRange(allocator, children.range2_start, children.range2_end, node, child_function, cursor);
+            try self.visitRange(allocator, children.range_start, children.range_end, node, child_function, cursor);
+            try self.visitRange(allocator, children.range2_start, children.range2_end, node, child_function, cursor);
+        }
 
         self.preorder_end[raw] = cursor.*;
     }
@@ -271,34 +292,39 @@ pub const TransformSession = struct {
         current_function: ?NodeIndex,
     ) Allocator.Error!void {
         const raw = @intFromEnum(node);
-        const name = self.ast.tokenSlice(self.ast.nodes.items(.main_token)[raw]);
-        const gop = try self.identifier_occurrences.getOrPut(allocator, name);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = .empty;
-        }
+        const main_token = self.ast.nodes.items(.main_token)[raw];
         const occurrence: IdentifierOccurrence = .{
             .node = node,
             .function_boundary = current_function,
-            .start = self.ast.tokens.items(.start)[@intFromEnum(self.ast.nodes.items(.main_token)[raw])],
+            .start = self.ast.tokens.items(.start)[@intFromEnum(main_token)],
         };
-        try gop.value_ptr.append(allocator, occurrence);
         if (self.scope) |scope| {
-            if (scope_mod.resolveBindingIndexForNode(scope, node, name)) |binding_idx| {
-                self.resolved_binding_for_node[raw] = binding_idx;
-                if (binding_idx < self.binding_occurrences.len) {
-                    try self.binding_occurrences[binding_idx].append(allocator, occurrence);
+            // Scope analysis already resolved all resolvable identifiers into
+            // node_to_binding; an O(1) array read is sufficient.
+            if (scope_mod.getBindingIndexForNode(scope, node)) |idx| {
+                self.resolved_binding_for_node[raw] = idx;
+                if (idx < self.binding_occurrences.len) {
+                    try self.binding_occurrences[idx].append(allocator, occurrence);
                 }
+                return;
             }
         }
+        // Unresolved or no scope: record in unresolved_occurrences hash map.
+        const name = self.ast.tokenSlice(main_token);
+        const gop = try self.unresolved_occurrences.getOrPut(allocator, name);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .empty;
+        }
+        try gop.value_ptr.append(allocator, occurrence);
     }
 
     fn sortOccurrences(self: *TransformSession) void {
-        var occurrence_iter = self.identifier_occurrences.valueIterator();
-        while (occurrence_iter.next()) |occurrences| {
-            sortIdentifierOccurrencesIfNeeded(occurrences);
-        }
         sortThisOccurrencesIfNeeded(self.ast, self.this_occurrences.items);
         for (self.binding_occurrences) |*occurrences| {
+            sortIdentifierOccurrencesIfNeeded(occurrences);
+        }
+        var unresolved_iter = self.unresolved_occurrences.valueIterator();
+        while (unresolved_iter.next()) |occurrences| {
             sortIdentifierOccurrencesIfNeeded(occurrences);
         }
     }
@@ -392,17 +418,5 @@ pub const TransformSession = struct {
             => true,
             else => false,
         };
-    }
-
-    fn containingFunctionScope(result: *const scope_mod.ScopeResult, scope_idx: scope_mod.ScopeIndex) scope_mod.ScopeIndex {
-        var current: ?scope_mod.ScopeIndex = scope_idx;
-        while (current) |idx| {
-            const scope = result.scopes[@intFromEnum(idx)];
-            switch (scope.kind) {
-                .function, .arrow, .global, .module => return idx,
-                else => current = scope.parent,
-            }
-        }
-        return scope_idx;
     }
 };

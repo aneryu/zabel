@@ -189,17 +189,7 @@ fn findEnclosingFunctionScope(scope_result: *const scope_mod.ScopeResult, start:
     return null;
 }
 
-fn containingFunctionScope(scope_result: *const scope_mod.ScopeResult, scope_idx: scope_mod.ScopeIndex) scope_mod.ScopeIndex {
-    var current: ?scope_mod.ScopeIndex = scope_idx;
-    while (current) |idx| {
-        const scope = scope_result.scopes[@intFromEnum(idx)];
-        switch (scope.kind) {
-            .function, .arrow, .global, .module => return idx,
-            else => current = scope.parent,
-        }
-    }
-    return scope_idx;
-}
+// containingFunctionScope is now pre-computed in ScopeResult.
 
 fn nameNeedsRename(
     ctx: *TransformContext,
@@ -237,12 +227,12 @@ fn getSiblingBindingInfo(
 ) SiblingBindingInfo {
     const current_start = nodeStartOffset(ctx, decl_node);
     var result = SiblingBindingInfo{};
-    const owner_scope_idx = func_scope_idx orelse containingFunctionScope(scope_result, scope_idx);
+    const owner_scope_idx = func_scope_idx orelse scope_result.containingFunctionScope(scope_idx);
     const binding_indices = bindingIndicesForName(ctx, name) orelse return result;
     for (binding_indices) |binding_idx_raw| {
         const b = scope_result.bindings[binding_idx_raw];
         if (b.scope == scope_idx) continue;
-        if (containingFunctionScope(scope_result, b.scope) != owner_scope_idx) continue;
+        if (scope_result.containingFunctionScope(b.scope) != owner_scope_idx) continue;
 
         result.has_any = true;
         if (nodeStartOffset(ctx, b.node) < current_start) {
@@ -300,7 +290,7 @@ fn hasFunctionScopeBinding(
     };
     for (binding_indices) |binding_idx_raw| {
         const b = result.bindings[binding_idx_raw];
-        if (containingFunctionScope(result, b.scope) != fs_idx) continue;
+        if (result.containingFunctionScope(b.scope) != fs_idx) continue;
         if (b.scope != fs_idx) continue;
         if (b.kind == .param and b.is_rest_param and !restParamHasReferencesInFunctionBody(ctx, result, fs_idx, binding_idx_raw)) {
             continue;
@@ -502,12 +492,24 @@ fn nameReferencedOutsideBlock(ctx: *TransformContext, decl_node: NodeIndex, bloc
     if (func_end > ctx.ast.source.len) func_end = @intCast(ctx.ast.source.len);
 
     if (ctx.session) |session| {
-        const occurrences = session.identifierOccurrences(name) orelse return false;
-        const func_occurrence_start = lowerBoundIdentifierOccurrence(occurrences, func_start);
-        const func_occurrence_end = lowerBoundIdentifierOccurrence(occurrences, func_end);
-        const block_occurrence_start = lowerBoundIdentifierOccurrence(occurrences, block_start);
-        const block_occurrence_end = lowerBoundIdentifierOccurrence(occurrences, block_end);
-        return (func_occurrence_end - func_occurrence_start) > (block_occurrence_end - block_occurrence_start);
+        var func_refs: usize = 0;
+        var block_refs: usize = 0;
+
+        // Count resolved binding occurrences.
+        if (session.bindingIndices(name)) |binding_indices| {
+            for (binding_indices) |binding_idx| {
+                const occurrences = session.bindingOccurrences(binding_idx);
+                func_refs += lowerBoundIdentifierOccurrence(occurrences, func_end) - lowerBoundIdentifierOccurrence(occurrences, func_start);
+                block_refs += lowerBoundIdentifierOccurrence(occurrences, block_end) - lowerBoundIdentifierOccurrence(occurrences, block_start);
+            }
+        }
+
+        // Count unresolved (free) references — e.g. `a` in `{ a; } { let a; }`.
+        const unresolved = session.unresolvedOccurrences(name);
+        func_refs += lowerBoundIdentifierOccurrence(unresolved, func_end) - lowerBoundIdentifierOccurrence(unresolved, func_start);
+        block_refs += lowerBoundIdentifierOccurrence(unresolved, block_end) - lowerBoundIdentifierOccurrence(unresolved, block_start);
+
+        return func_refs > block_refs;
     }
 
     return false;
@@ -4177,8 +4179,8 @@ fn classifyTdzReference(
     const ref_scope_idx = scope_mod.getScopeForNode(scope_result, ref_node) orelse return .none;
     const ref_before_decl = nodeStartOffset(ctx, ref_node) < decl_start;
     const ref_inside_decl = isDescendantOf(ref_node, decl_node);
-    const binding_func_scope = containingFunctionScope(scope_result, binding.scope);
-    const ref_func_scope = containingFunctionScope(scope_result, ref_scope_idx);
+    const binding_func_scope = scope_result.containingFunctionScope(binding.scope);
+    const ref_func_scope = scope_result.containingFunctionScope(ref_scope_idx);
 
     if (ref_func_scope == binding_func_scope) {
         if (ref_before_decl or ref_inside_decl) return .direct;
@@ -4499,12 +4501,12 @@ fn countEarlierRenamedBindings(ctx: *TransformContext, decl_node: NodeIndex, ori
     const current_start = nodeStartOffset(ctx, decl_node);
 
     var count: u32 = 0;
-    const owner_scope_idx = func_scope_idx orelse containingFunctionScope(scope_result, scope_idx);
+    const owner_scope_idx = func_scope_idx orelse scope_result.containingFunctionScope(scope_idx);
     const binding_indices = bindingIndicesForName(ctx, original) orelse return 0;
     for (binding_indices) |binding_idx_raw| {
         const b = scope_result.bindings[binding_idx_raw];
         if (b.node == decl_node) continue;
-        if (containingFunctionScope(scope_result, b.scope) != owner_scope_idx) continue;
+        if (scope_result.containingFunctionScope(b.scope) != owner_scope_idx) continue;
         if (b.kind != .let_decl and b.kind != .const_decl) continue;
         if (!isScopeWithinFunction(scope_result, b.scope, func_scope_idx)) continue;
         if (nodeStartOffset(ctx, b.node) >= current_start) continue;

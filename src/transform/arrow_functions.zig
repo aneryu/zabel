@@ -1061,13 +1061,27 @@ fn hasRelevantIdentifierOccurrence(
     body_node: NodeIndex,
     name: []const u8,
 ) bool {
-    const occurrences = session.identifierOccurrences(name) orelse return false;
     const body_range = session.subtreeRange(body_node);
-    for (occurrences) |occurrence| {
-        const occurrence_range = session.subtreeRange(occurrence.node);
-        if (occurrence_range.start < body_range.start or occurrence_range.end > body_range.end) continue;
+
+    // Check unresolved occurrences (globals, free refs — e.g. `arguments`).
+    const unresolved = session.unresolvedOccurrences(name);
+    for (unresolved) |occurrence| {
+        const r = session.subtreeRange(occurrence.node);
+        if (r.start < body_range.start or r.end > body_range.end) continue;
         if (isExcludedFromArrowDirectReference(session, ctx, body_node, occurrence.node)) continue;
         return true;
+    }
+
+    // Check resolved binding occurrences.
+    if (session.bindingIndices(name)) |indices| {
+        for (indices) |binding_idx| {
+            for (session.bindingOccurrences(binding_idx)) |occurrence| {
+                const r = session.subtreeRange(occurrence.node);
+                if (r.start < body_range.start or r.end > body_range.end) continue;
+                if (isExcludedFromArrowDirectReference(session, ctx, body_node, occurrence.node)) continue;
+                return true;
+            }
+        }
     }
 
     return false;

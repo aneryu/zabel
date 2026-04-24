@@ -37,6 +37,61 @@ pub const ChildList = struct {
     }
 };
 
+// ── Leaf-tag predicate ──────────────────────────────────────────
+
+/// Tags that have zero structural children.  Used by callers to skip
+/// `getChildren()` entirely, avoiding the switch-dispatch overhead.
+pub fn isLeafTag(tag: Node.Tag) bool {
+    return switch (tag) {
+        .removed,
+        .numeric_literal,
+        .string_literal,
+        .boolean_literal,
+        .null_literal,
+        .regex_literal,
+        .bigint_literal,
+        .identifier,
+        .v8_intrinsic_identifier,
+        .this_expr,
+        .super_expr,
+        .empty_statement,
+        .debugger_statement,
+        .directive_literal,
+        .jsx_empty_expression,
+        .jsx_text,
+        .jsx_string_literal,
+        .jsx_identifier,
+        .ts_keyword_type,
+        .topic_reference,
+        .placeholder,
+        .export_default_specifier,
+        .import_default,
+        .import_namespace,
+        .ts_namespace_export_declaration,
+        .flow_number_type,
+        .flow_string_type,
+        .flow_boolean_type,
+        .flow_void_type,
+        .flow_mixed_type,
+        .flow_empty_type,
+        .flow_any_type,
+        .flow_symbol_type,
+        .flow_bigint_type,
+        .flow_null_literal_type,
+        .flow_number_literal_type,
+        .flow_string_literal_type,
+        .flow_boolean_literal_type,
+        .flow_bigint_literal_type,
+        .flow_exists_type,
+        .flow_inferred_predicate,
+        .flow_this_type_annotation,
+        .flow_variance,
+        .flow_enum_default_member,
+        => true,
+        else => false,
+    };
+}
+
 // ── getChildren ─────────────────────────────���────────────────────────
 
 /// Return a ChildList enumerating all direct structural children of the

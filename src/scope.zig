@@ -121,7 +121,11 @@ fn DenseNodeMap(comptime T: type) type {
 
         pub fn put(self: *Self, allocator: Allocator, key: u32, value: T) Allocator.Error!void {
             _ = allocator;
-            std.debug.assert(key < self.values.len);
+            self.values[key] = toRaw(value);
+        }
+
+        /// Direct write without allocator parameter; array must already be sized.
+        pub fn putDirect(self: *Self, key: u32, value: T) void {
             self.values[key] = toRaw(value);
         }
 
@@ -139,7 +143,10 @@ pub const ScopeResult = struct {
     binding_name_indices: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(u32)),
     node_to_scope: DenseNodeMap(ScopeIndex),
     node_to_binding: DenseNodeMap(u32),
+    /// Backing allocation for node_to_scope and node_to_binding (single block).
     dense_map_block: []u32 = &.{},
+    /// Pre-computed containing function scope for each scope index.
+    containing_fn_scope: []const ScopeIndex = &.{},
     allocator: Allocator,
 
     pub fn deinit(self: *ScopeResult) void {
@@ -158,6 +165,13 @@ pub const ScopeResult = struct {
             self.node_to_scope.deinit(self.allocator);
             self.node_to_binding.deinit(self.allocator);
         }
+        if (self.containing_fn_scope.len > 0) self.allocator.free(self.containing_fn_scope);
+    }
+
+    pub fn containingFunctionScope(self: *const ScopeResult, scope_idx: ScopeIndex) ScopeIndex {
+        const i = @intFromEnum(scope_idx);
+        if (i < self.containing_fn_scope.len) return self.containing_fn_scope[i];
+        return scope_idx;
     }
 };
 
@@ -189,6 +203,10 @@ pub fn analyzeWithOptions(ast: *const Ast, allocator: Allocator, options: Analyz
     builder.node_to_binding = .{};
     const dense_map_block = builder.dense_map_block;
     builder.dense_map_block = &.{};
+
+    // Pre-compute containing function scope for each scope.
+    const containing_fn_scope = try buildContainingFnScope(allocator, scopes);
+
     return ScopeResult{
         .scopes = scopes,
         .bindings = bindings,
@@ -198,8 +216,20 @@ pub fn analyzeWithOptions(ast: *const Ast, allocator: Allocator, options: Analyz
         .node_to_scope = node_to_scope,
         .node_to_binding = node_to_binding,
         .dense_map_block = dense_map_block,
+        .containing_fn_scope = containing_fn_scope,
         .allocator = allocator,
     };
+}
+
+fn buildContainingFnScope(allocator: Allocator, scopes: []const Scope) ![]ScopeIndex {
+    const result = try allocator.alloc(ScopeIndex, scopes.len);
+    for (scopes, 0..) |scope, i| {
+        result[i] = switch (scope.kind) {
+            .function, .arrow, .global, .module => @enumFromInt(@as(u32, @intCast(i))),
+            else => if (scope.parent) |p| result[@intFromEnum(p)] else @enumFromInt(@as(u32, @intCast(i))),
+        };
+    }
+    return result;
 }
 
 // ── Query Functions ──────────────────────────────────────────────────
@@ -360,6 +390,7 @@ const Builder = struct {
     binding_name_indices: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(u32)),
     node_to_scope: DenseNodeMap(ScopeIndex),
     node_to_binding: DenseNodeMap(u32),
+    /// Single backing allocation for both DenseNodeMaps.
     dense_map_block: []u32 = &.{},
     /// Stack of scope indices during traversal
     scope_stack: std.ArrayListUnmanaged(ScopeIndex),
@@ -432,11 +463,11 @@ const Builder = struct {
     fn run(self: *Builder) !void {
         if (self.ast.nodes.len == 0) return;
         const node_count = self.ast.nodes.items(.tag).len;
-        const block = try self.allocator.alloc(u32, 2 * node_count);
-        @memset(block, dense_node_map_none);
-        self.dense_map_block = block;
-        self.node_to_scope.values = block[0..node_count];
-        self.node_to_binding.values = block[node_count..];
+        // Single allocation for both dense node maps.
+        self.dense_map_block = try self.allocator.alloc(u32, node_count * 2);
+        @memset(self.dense_map_block, dense_node_map_none);
+        self.node_to_scope.values = self.dense_map_block[0..node_count];
+        self.node_to_binding.values = self.dense_map_block[node_count .. node_count * 2];
 
         // Create root scope
         const root_kind: ScopeKind = if (self.ast.source_type == .module) .module else .global;
@@ -466,7 +497,7 @@ const Builder = struct {
             .bindings_end = @intCast(self.bindings.items.len),
         });
         try self.scope_stack.append(self.allocator, idx);
-        try self.node_to_scope.put(self.allocator, @intFromEnum(node), idx);
+        self.node_to_scope.putDirect(@intFromEnum(node), idx);
         return idx;
     }
 
@@ -498,7 +529,7 @@ const Builder = struct {
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         try gop.value_ptr.append(self.allocator, binding_idx);
         if (node != .none) {
-            try self.node_to_binding.put(self.allocator, @intFromEnum(node), binding_idx);
+            self.node_to_binding.putDirect(@intFromEnum(node), binding_idx);
         }
     }
 
@@ -579,10 +610,16 @@ const Builder = struct {
         const tag = tags[i];
         if (tag == .removed) return;
 
-        const data = self.ast.nodes.items(.data)[i];
-
         // Map this node to the current scope
-        try self.node_to_scope.put(self.allocator, i, self.currentScope());
+        self.node_to_scope.putDirect(i, self.currentScope());
+
+        // Leaf tags have no children; only .identifier needs binding resolution.
+        if (visitor.isLeafTag(tag)) {
+            if (tag == .identifier) self.visitIdentifierRef(idx);
+            return;
+        }
+
+        const data = self.ast.nodes.items(.data)[i];
 
         switch (tag) {
             // ── Scope-creating nodes ─────────────────────────────────
@@ -625,10 +662,6 @@ const Builder = struct {
             .import_declaration_type,
             .import_declaration_typeof,
             => try self.visitImportDeclaration(idx, data),
-
-            // ── Identifier references ────────────────────────────────
-
-            .identifier => self.visitIdentifierRef(idx),
 
             // ── Assignment targets ───────────────────────────────────
 
@@ -1153,7 +1186,7 @@ const Builder = struct {
         const name = self.ast.tokenSlice(mt);
 
         const binding_idx = self.findVisibleBindingIndex(name) orelse return;
-        self.node_to_binding.put(self.allocator, i, binding_idx) catch {};
+        self.node_to_binding.putDirect(i, binding_idx);
         if (self.crossesFunctionBoundary(self.bindings.items[binding_idx].scope)) {
             self.bindings.items[binding_idx].is_captured = true;
         }
