@@ -49,6 +49,11 @@
 - ts_strip: bulk-clear dense TS side tables (`type_annotations`, `return_types`, `type_parameters`, `ts_optional_params`) during `.program` enter, removing 11 high-frequency tags from the node filter (identifier, rest_element, patterns, call_expr, etc.). Enter calls dropped ~76% (7700 → 1790 on `useSelection.js`).
 - `core` tier A/B (10 iterations, interleaved): baseline `172.8M ns` → optimized `165.2M ns` (−4.4%). `ts_strip` total_ns on `useSelection.js` improved ~19.8%, `traversal_ns` improved ~19.8%, `pipeline_ns` improved ~9.5%.
 
+- Deferred `ensureCommentsAttached()` from `pipeline.run()` — no transform pass reads the `leading_comments` / `trailing_comments` / `inner_comments` maps. Codegen calls it lazily when needed.
+- Made `Codegen.generate()` skip `ensureCommentsAttached()` when `options.comments` is `false` — when comments are disabled, the codegen marks all comments as already emitted anyway, so the expensive O(n log n) sort + binary-search is unnecessary.
+- `core` tier A/B (10 iterations, interleaved): baseline `167.3M ns` → optimized `143.1M ns` (**−14.5%**). Per-file pipeline_ns improvements: AnimatedImplementation.js −17.8%, AnimatedValue.js −16.8%, PanResponder.js −19.2%, Form.js −11.6%, InternalTable.js −16.4%, useSelection.js −19.1%.
+- Also attempted iterative session DFS (explicit stack replacing recursive `visitNode`): reverted after benchmarks showed net regression due to worse cache locality from stack entry memory competing with AST data.
+
 ## Likely Next Steps
 
 - `scope_analysis_ns` (~8.5M) is still significant; the `findVisibleBindingIndex` hash lookup + scope-chain walk for each identifier is the per-node bottleneck — a name→binding cache updated on scope push/pop could eliminate many repeated lookups.
@@ -79,4 +84,6 @@
 - 2026-04-24: `zig build test` passed after childLayout fast path in Pipeline, TransformSession, and scope analysis.
 - 2026-04-24: `zig build conformance-test` completed: parser `5891 pass / 0 fail`, codegen `486 pass / 0 fail`, transform `832 pass / 2 fail` (same 2 pre-existing failures).
 - 2026-04-24: `zig build test` passed after ts_strip dispatch optimization (exit_filter + bulk side-table clear).
+- 2026-04-24: `zig build conformance-test` completed: parser `5891 pass / 0 fail`, codegen `486 pass / 0 fail`, transform `832 pass / 2 fail` (same 2 pre-existing failures).
+- 2026-04-24: `zig build test` passed after deferred comment attachment.
 - 2026-04-24: `zig build conformance-test` completed: parser `5891 pass / 0 fail`, codegen `486 pass / 0 fail`, transform `832 pass / 2 fail` (same 2 pre-existing failures).

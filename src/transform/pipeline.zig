@@ -326,7 +326,9 @@ pub const Pipeline = struct {
             null;
 
         try ast.ensureTypeSideTablesMaterialized();
-        ast.ensureCommentsAttached();
+        // Note: ensureCommentsAttached() is NOT called here — no transform
+        // pass reads leading_comments / trailing_comments / inner_comments.
+        // Codegen calls it lazily when it needs the data.
 
         // Sort passes by priority (lower = earlier).
         std.mem.sort(Pass, self.passes.items, {}, struct {

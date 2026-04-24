@@ -97,7 +97,10 @@ pub const Codegen = struct {
 
     pub fn generate(ast: *const Ast, options: Options, allocator: std.mem.Allocator) !GenerateResult {
         try @constCast(ast).ensureTypeSideTablesMaterialized();
-        @constCast(ast).ensureCommentsAttached();
+        // Only build leading/trailing/inner comment maps when codegen will
+        // actually emit comments.  When comments are disabled the maps are
+        // never read, so the expensive sort + binary-search is skipped.
+        if (options.comments) @constCast(ast).ensureCommentsAttached();
         var sm: ?SourceMapBuilder = if (options.source_maps) SourceMapBuilder.init(allocator) else null;
         const sm_ptr: ?*SourceMapBuilder = if (sm != null) &sm.? else null;
 
