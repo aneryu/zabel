@@ -202,7 +202,7 @@ pub const TransformSession = struct {
         for (self.function_binding_indices) |*map| map.* = .{};
 
         for (scope.bindings, 0..) |binding, binding_idx| {
-            const owner_scope_idx = containingFunctionScope(scope, binding.scope);
+            const owner_scope_idx = scope.containingFunctionScope(binding.scope);
             const owner_scope_i = @intFromEnum(owner_scope_idx);
             if (owner_scope_i >= self.function_binding_indices.len) continue;
 
@@ -287,18 +287,14 @@ pub const TransformSession = struct {
             .start = self.ast.tokens.items(.start)[@intFromEnum(main_token)],
         };
         if (self.scope) |scope| {
-            // Fast path: use the direct node→binding mapping from scope analysis (O(1) lookup).
-            const binding_idx = scope_mod.getBindingIndexForNode(scope, node) orelse blk: {
-                // Slow path: resolve via name + scope chain.
-                const name = self.ast.tokenSlice(main_token);
-                break :blk scope_mod.resolveBindingIndexForNode(scope, node, name);
-            };
-            if (binding_idx) |idx| {
+            // Scope analysis already resolved all resolvable identifiers into
+            // node_to_binding; an O(1) array read is sufficient.
+            if (scope_mod.getBindingIndexForNode(scope, node)) |idx| {
                 self.resolved_binding_for_node[raw] = idx;
                 if (idx < self.binding_occurrences.len) {
                     try self.binding_occurrences[idx].append(allocator, occurrence);
                 }
-                return; // Resolved — skip unresolved hash map.
+                return;
             }
         }
         // Unresolved or no scope: record in unresolved_occurrences hash map.
@@ -410,17 +406,5 @@ pub const TransformSession = struct {
             => true,
             else => false,
         };
-    }
-
-    fn containingFunctionScope(result: *const scope_mod.ScopeResult, scope_idx: scope_mod.ScopeIndex) scope_mod.ScopeIndex {
-        var current: ?scope_mod.ScopeIndex = scope_idx;
-        while (current) |idx| {
-            const scope = result.scopes[@intFromEnum(idx)];
-            switch (scope.kind) {
-                .function, .arrow, .global, .module => return idx,
-                else => current = scope.parent,
-            }
-        }
-        return scope_idx;
     }
 };

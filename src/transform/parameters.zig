@@ -2112,7 +2112,7 @@ fn restoreElidedRestShadowBinding(
     for (same_name_bindings.items) |binding_idx| {
         if (binding_idx == rest_binding_idx) continue;
         const binding = scope_result.bindings[binding_idx];
-        const owner_scope_idx = containingFunctionScope(scope_result, binding.scope);
+        const owner_scope_idx = scope_result.containingFunctionScope(binding.scope);
         if (owner_scope_idx != func_scope_idx) continue;
         if (binding.scope == func_scope_idx) return;
         shadow_count += 1;
@@ -2130,21 +2130,6 @@ fn restoreElidedRestShadowBinding(
         renameResolvedBindingInSubtree(ctx, body_node, binding_idx, rp.name);
         restoreShadowBindingDeclChain(ctx, binding.node, body_node, fallback_name, rp.name);
     }
-}
-
-fn containingFunctionScope(
-    scope_result: *const scope_mod.ScopeResult,
-    scope_idx: scope_mod.ScopeIndex,
-) scope_mod.ScopeIndex {
-    var current: ?scope_mod.ScopeIndex = scope_idx;
-    while (current) |idx| {
-        const scope = scope_result.scopes[@intFromEnum(idx)];
-        switch (scope.kind) {
-            .function, .arrow, .global, .module => return idx,
-            else => current = scope.parent,
-        }
-    }
-    return scope_idx;
 }
 
 fn restoreShadowBindingDeclChain(

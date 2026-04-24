@@ -30,10 +30,17 @@
 - `useSelection.js` profile results (median of 5, 3 warmups): `transform_session_ns` dropped from `13.1M` to `7.5M` (−43%), `pipeline_ns` dropped from `51.8M` to `44.8M` (−13.5%), `traversal_ns` dropped from `19.6M` to `19.0M` (−3.1%).
 - `core` tier total: `zig_total_ns` dropped from `321.4M` to `311.0M` (−3.2%), `p95_total_ns` dropped from `95.6M` to `86.7M` (−9.3%).
 
+- Optimized scope analysis: added leaf-tag early return in `Builder.visit()` (skips data read, switch dispatch, and `visitChildren` for ~30-40% of nodes); consolidated two DenseNodeMap allocations into a single block; switched all `node_to_scope.put` / `node_to_binding.put` calls to `putDirect` (no allocator parameter, no bounds assert overhead in release).
+- Pre-computed `containing_fn_scope[]` in `ScopeResult` (O(N_scopes) at build time, O(1) lookup at use time). Replaced per-call scope-chain walks in `session.zig`, `block_scoping.zig`, and `parameters.zig`.
+- Removed slow-path `resolveBindingIndexForNode` fallback from `TransformSession.recordIdentifierOccurrence`: scope analysis already resolves all resolvable identifiers into `node_to_binding`; the fallback was redundant.
+- `useSelection.js` profile results (median of 5, 3 warmups): `scope_analysis_ns` dropped from `10.1M` to `9.5M` (−6.2%), `transform_session_ns` dropped from `7.5M` to `7.0M` (−5.9%), `pipeline_ns` dropped from `44.6M` to `42.6M` (−4.4%).
+- `core` tier total: `zig_total_ns` dropped from `296.2M` to `291.5M` (−1.6%), `p95_total_ns` dropped from `84.7M` to `83.3M` (−1.7%). All 6 files improved.
+
 ## Likely Next Steps
 
-- `transform_session_ns` is now ~7.5M on the hottest file; further gains likely require merging the parent/preorder traversal with scope analysis to avoid a second full-AST walk.
-- `traversal_ns` (~19M) and `scope_analysis_ns` (~10M) are the remaining dominant costs.
+- `traversal_ns` (~18.2M) is the single largest component; further gains likely require reducing per-node overhead in `Pipeline.visitNode` (e.g. inlining hot paths, reducing function-call depth for single-child chains).
+- `scope_analysis_ns` (~9.5M) is still significant; the `findVisibleBindingIndex` hash lookup + scope-chain walk for each identifier is the per-node bottleneck — a name→binding cache updated on scope push/pop could eliminate many repeated lookups.
+- Merging the parent/preorder traversal into scope analysis would eliminate the second full-AST walk, saving ~7M ns, but requires coupling scope analysis to TransformSession data structures.
 - Keep removing pass-local structural or lookup caches when equivalent session-backed data already exists.
 - Treat `core` before/after measurements as the acceptance metric; use `full` as a confirmation run after material shared-infrastructure changes.
 
@@ -52,3 +59,5 @@
 - 2026-04-23: `zig build conformance-test` completed: parser `5891 pass / 0 fail`, codegen `486 pass / 0 fail`, transform `832 pass / 2 fail` (same 2 pre-existing failures as baseline).
 - 2026-04-24: `zig build test` passed after identifier hash map elimination and leaf-tag fast path.
 - 2026-04-24: `zig build conformance-test` completed: parser `5891 pass / 0 fail`, codegen `486 pass / 0 fail`, transform `829 pass / 5 fail` (same pre-existing failures as baseline).
+- 2026-04-24: `zig build test` passed after scope analysis leaf-tag fast path, DenseNodeMap consolidation, and containing_fn_scope pre-computation.
+- 2026-04-24: `zig build conformance-test` completed: transform `829 pass / 5 fail` (same pre-existing failures).
