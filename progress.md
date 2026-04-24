@@ -24,6 +24,10 @@
 - Replaced `std.c.clock_gettime` in `monotonicNowNs()` with `std.os.linux.clock_gettime` to remove libc dependency from the transform pipeline, allowing benchmarks and tests to compile without linking libc.
 - Optimized `ts_strip.scanImportUsage()`: limited `collectImportedNames` and `collectLocalDeclarations` to program body statements instead of all AST nodes; added session-backed `scanValueUsagesViaSession` that uses `TransformSession.identifierOccurrences()` + parent chain walks to determine type context, avoiding the O(N) recursive AST traversal in `scanValueUsages`.
 - Measured `core` tier improvement: `ts_strip` pass time on `useSelection.js` dropped from `3.15M ns` to `1.72M ns` (45% reduction); traversal_ns dropped 24.5%; overall transform phase improved ~11.7%.
+- Consolidated `TransformSession.init()` from 6 separate `allocator.alloc(node_count)` + 6 `@memset` calls into a single allocation with 2 memset passes. Added `node_data_block` field; `deinit` frees one block instead of six.
+- Consolidated scope analysis `DenseNodeMap` allocations (`node_to_scope` + `node_to_binding`) into a single block with ownership transfer to `ScopeResult` via `dense_map_block` field.
+- Pre-sized `identifier_occurrences` hash map with `ensureTotalCapacity(node_count/8)` to reduce rehashing during the `buildParentAndRanges` traversal.
+- Measured `transform_session_ns` improvement on `useSelection.js`: median 2.39M ns (down from 2.58M ns baseline, ~7.5% reduction). `scope_analysis_ns` also showed a small reduction (~2.3%).
 
 - Eliminated `identifier_occurrences` StringHashMap from `TransformSession`: resolved identifiers (~90%) now go directly into `binding_occurrences` arrays, skipping the hash map entirely; only unresolved identifiers (globals, free refs, no-scope case) fall back to a smaller `unresolved_occurrences` hash map. Callers in `block_scoping` and `ts_strip` now iterate `bindingIndices` + `bindingOccurrences` directly. `arrow_functions` uses `identifierOccurrences()` which checks unresolved map first then derives from binding occurrences.
 - Added `visitor.isLeafTag()` predicate (matching the 0-children tags from `getChildren`). Used it to skip the `getChildren()` switch dispatch for leaf nodes in both `TransformSession.visitNode` and `Pipeline.visitNode`.
@@ -57,6 +61,8 @@
 - 2026-04-20: post-session-shortcut `full` confirmation run `bash scripts/bench-real-projects.sh --tier full` completed with `zig_total_ns=49,681,456` and `transform=28,522,541`.
 - 2026-04-23: `zig build test` passed after `monotonicNowNs` and `scanImportUsage` optimizations.
 - 2026-04-23: `zig build conformance-test` completed: parser `5891 pass / 0 fail`, codegen `486 pass / 0 fail`, transform `832 pass / 2 fail` (same 2 pre-existing failures as baseline).
+- 2026-04-24: `zig build test` passed after allocation consolidation and hash map pre-sizing.
+- 2026-04-24: `zig build conformance-test` completed: parser `5891 pass / 0 fail`, codegen `486 pass / 0 fail`, transform `832 pass / 2 fail` (same 2 pre-existing failures).
 - 2026-04-24: `zig build test` passed after identifier hash map elimination and leaf-tag fast path.
 - 2026-04-24: `zig build conformance-test` completed: parser `5891 pass / 0 fail`, codegen `486 pass / 0 fail`, transform `829 pass / 5 fail` (same pre-existing failures as baseline).
 - 2026-04-24: `zig build test` passed after scope analysis leaf-tag fast path, DenseNodeMap consolidation, and containing_fn_scope pre-computation.
