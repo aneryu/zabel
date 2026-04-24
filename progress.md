@@ -21,11 +21,14 @@
 - Made `TransformSession` skip its disconnected-node fallback sweep when the root traversal already covered the full AST, and changed occurrence ordering to sort only when traversal produced out-of-order data instead of sorting every collected list unconditionally.
 - Re-measured the current `core` tier after the `TransformSession` ordering shortcuts: one noisy rerun overshot, but the follow-up confirmation landed at `zig_total_ns=43,124,960` / `transform=23,492,375`, with `transform_session_ns` dropping on the main hotspots (`useSelection.js`: `1,521,000ns`, `AnimatedImplementation.js`: `1,300,000ns`, `InternalTable.js`: `1,051,000ns`).
 - Confirmed the current `full` tier also improved after the session shortcuts: `zig_total_ns=49,681,456` and `transform=28,522,541`, down from the prior `53,295,541ns` / `32,388,666ns` confirmation run.
+- Replaced `std.c.clock_gettime` in `monotonicNowNs()` with `std.os.linux.clock_gettime` to remove libc dependency from the transform pipeline, allowing benchmarks and tests to compile without linking libc.
+- Optimized `ts_strip.scanImportUsage()`: limited `collectImportedNames` and `collectLocalDeclarations` to program body statements instead of all AST nodes; added session-backed `scanValueUsagesViaSession` that uses `TransformSession.identifierOccurrences()` + parent chain walks to determine type context, avoiding the O(N) recursive AST traversal in `scanValueUsages`.
+- Measured `core` tier improvement: `ts_strip` pass time on `useSelection.js` dropped from `3.15M ns` to `1.72M ns` (45% reduction); traversal_ns dropped 24.5%; overall transform phase improved ~11.7%.
 
 ## Likely Next Steps
 
-- Continue targeting the remaining fixed-cost work in `core`: `ts_strip.scanImportUsage()` and traversal now dominate more clearly than `TransformSession` construction on the slow `antd` and `react-native` files.
-- Use the `--profile-top` output to investigate `profile_shared` traversal cost alongside the still-large `ts_strip` totals in `useSelection.js`, `InternalTable.js`, and `AnimatedImplementation.js`.
+- Remaining `core` hotspots are now `transform_session_ns` (~25%) and `scope_analysis_ns` (~20%); `ts_strip` and traversal are no longer dominant.
+- Look into reducing `TransformSession.init()` cost (parent map + occurrence index construction).
 - Keep removing pass-local structural or lookup caches when equivalent session-backed data already exists.
 - Treat `core` before/after measurements as the acceptance metric; use `full` as a confirmation run after material shared-infrastructure changes.
 
@@ -40,3 +43,5 @@
 - 2026-04-20: repeat `core` confirmation run recorded `zig_total_ns=43,559,502` and `transform=25,586,833` from `bash scripts/bench-real-projects.sh --tier core --profile-top 5`.
 - 2026-04-20: post-session-shortcut `core` confirmation run recorded `zig_total_ns=43,124,960` and `transform=23,492,375` from `bash scripts/bench-real-projects.sh --tier core --profile-top 5`.
 - 2026-04-20: post-session-shortcut `full` confirmation run `bash scripts/bench-real-projects.sh --tier full` completed with `zig_total_ns=49,681,456` and `transform=28,522,541`.
+- 2026-04-23: `zig build test` passed after `monotonicNowNs` and `scanImportUsage` optimizations.
+- 2026-04-23: `zig build conformance-test` completed: parser `5891 pass / 0 fail`, codegen `486 pass / 0 fail`, transform `832 pass / 2 fail` (same 2 pre-existing failures as baseline).
