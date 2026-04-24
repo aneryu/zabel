@@ -132,12 +132,23 @@ fn buildFullPipeline(
     return pipeline;
 }
 
-fn parseTs(alloc: std.mem.Allocator, source: []const u8) !zb.ParseResult {
+fn parseSource(alloc: std.mem.Allocator, source: []const u8, language: zb.Language) !zb.ParseResult {
     return zb.parseWithOptions(alloc, source, .{
         .source_type = .script,
-        .language = .typescript,
+        .language = language,
         .defer_comment_attachment = true,
     });
+}
+
+fn parseTs(alloc: std.mem.Allocator, source: []const u8) !zb.ParseResult {
+    return parseSource(alloc, source, .typescript);
+}
+
+fn languageFromPath(path: []const u8) zb.Language {
+    if (std.mem.endsWith(u8, path, ".tsx")) return .tsx;
+    if (std.mem.endsWith(u8, path, ".ts")) return .typescript;
+    if (std.mem.endsWith(u8, path, ".jsx")) return .jsx;
+    return .javascript;
 }
 
 fn benchStage(
@@ -379,8 +390,9 @@ fn benchFiles(
                 break :blk loaded;
             };
 
+            const lang = languageFromPath(file_path);
             const parse_timer = startTimer(io);
-            var result = try parseTs(alloc, source);
+            var result = try parseSource(alloc, source, lang);
             total_row.parse_ns +%= readTimerNs(io, parse_timer);
 
             var pipeline = try buildFullPipeline(alloc, telemetry_session, spanPtr(&files_span));
@@ -545,12 +557,13 @@ fn benchProfileFile(
         pass_totals.deinit(allocator);
     }
 
+    const lang = languageFromPath(file_path);
     for (0..total_iters) |iter| {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const alloc = arena.allocator();
 
-        var result = try parseTs(alloc, source);
+        var result = try parseSource(alloc, source, lang);
         var pipeline = try buildFullPipeline(alloc, telemetry_session, spanPtr(&profile_span));
         defer pipeline.deinit();
         pipeline.collect_run_stats = true;
