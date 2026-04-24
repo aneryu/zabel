@@ -40,9 +40,12 @@
 - `useSelection.js` profile results (median of 5, 3 warmups): `scope_analysis_ns` dropped from `10.1M` to `9.5M` (−6.2%), `transform_session_ns` dropped from `7.5M` to `7.0M` (−5.9%), `pipeline_ns` dropped from `44.6M` to `42.6M` (−4.4%).
 - `core` tier total: `zig_total_ns` dropped from `296.2M` to `291.5M` (−1.6%), `p95_total_ns` dropped from `84.7M` to `83.3M` (−1.7%). All 6 files improved.
 
+- Added `visitor.childLayout()` fast path: classifies each tag as `leaf`, `unary`, `binary`, `binary_lhs`, or `complex`. For `unary`/`binary`/`binary_lhs` tags (~55% of non-leaf nodes), the child nodes are read directly from `data.unary` or `data.binary` instead of going through the full `getChildren()` ~200-case switch dispatch. Applied to `Pipeline.visitNode`, `TransformSession.visitNode`, and scope analysis `Builder.visitChildren`.
+- Optimized `Pipeline.visitNode` exit dispatch: skip exit-tag re-read when no enter passes were registered for the tag; inline dispatch range checks to avoid function-call overhead on empty ranges.
+- `core` tier A/B (10 iterations, interleaved): baseline `588.5M ns` → optimized `576.7M ns` (−2.0%). Pipeline_ns on `InternalTable.js` improved ~7.8%, `AnimatedValue.js` ~8.4%.
+
 ## Likely Next Steps
 
-- `traversal_ns` (~18.2M) is the single largest component; further gains likely require reducing per-node overhead in `Pipeline.visitNode` (e.g. inlining hot paths, reducing function-call depth for single-child chains).
 - `scope_analysis_ns` (~9.5M) is still significant; the `findVisibleBindingIndex` hash lookup + scope-chain walk for each identifier is the per-node bottleneck — a name→binding cache updated on scope push/pop could eliminate many repeated lookups.
 - Merging the parent/preorder traversal into scope analysis would eliminate the second full-AST walk, saving ~7M ns, but requires coupling scope analysis to TransformSession data structures.
 - Keep removing pass-local structural or lookup caches when equivalent session-backed data already exists.
@@ -67,3 +70,5 @@
 - 2026-04-24: `zig build conformance-test` completed: parser `5891 pass / 0 fail`, codegen `486 pass / 0 fail`, transform `829 pass / 5 fail` (same pre-existing failures as baseline).
 - 2026-04-24: `zig build test` passed after scope analysis leaf-tag fast path, DenseNodeMap consolidation, and containing_fn_scope pre-computation.
 - 2026-04-24: `zig build conformance-test` completed: transform `829 pass / 5 fail` (same pre-existing failures).
+- 2026-04-24: `zig build test` passed after childLayout fast path in Pipeline, TransformSession, and scope analysis.
+- 2026-04-24: `zig build conformance-test` completed: parser `5891 pass / 0 fail`, codegen `486 pass / 0 fail`, transform `832 pass / 2 fail` (same 2 pre-existing failures).

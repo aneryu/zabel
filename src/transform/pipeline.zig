@@ -614,74 +614,91 @@ pub const Pipeline = struct {
         nodes_visited.* += 1;
 
         const tag = tags[i];
+        const tag_idx = @intFromEnum(tag);
 
         // ── Enter passes ─────────────────────────────────────────────
-        for (dispatch_table.enterForTag(tag)) |pass_index| {
-            const pass = self.passes.items[pass_index];
-            const enter_fn = pass.enter orelse continue;
-            const result = if (pass_stats) |stats| blk: {
-                const started_ns = monotonicNowNs();
-                const visit_result = enter_fn(idx, ctx);
-                stats[pass_index].total_ns += monotonicNsDelta(started_ns, monotonicNowNs()) orelse 0;
-                stats[pass_index].enter_calls += 1;
-                break :blk visit_result;
-            } else enter_fn(idx, ctx);
-            switch (result) {
-                .skip_children => return,
-                .remove_node => {
-                    ast_ops.removeNode(ctx.ast, idx);
-                    return;
-                },
-                .continue_traversal => {},
+        const enter_range = dispatch_table.enter_ranges[tag_idx];
+        if (enter_range.len > 0) {
+            for (dispatch_table.enter_indices[enter_range.start .. enter_range.start + enter_range.len]) |pass_index| {
+                const pass = self.passes.items[pass_index];
+                const enter_fn = pass.enter orelse continue;
+                const result = if (pass_stats) |stats| blk: {
+                    const started_ns = monotonicNowNs();
+                    const visit_result = enter_fn(idx, ctx);
+                    stats[pass_index].total_ns += monotonicNsDelta(started_ns, monotonicNowNs()) orelse 0;
+                    stats[pass_index].enter_calls += 1;
+                    break :blk visit_result;
+                } else enter_fn(idx, ctx);
+                switch (result) {
+                    .skip_children => return,
+                    .remove_node => {
+                        ast_ops.removeNode(ctx.ast, idx);
+                        return;
+                    },
+                    .continue_traversal => {},
+                }
             }
         }
 
         // ── Recurse into children ────────────────────────────────────
-        if (!visitor.isLeafTag(tag)) {
-            const children = visitor.getChildren(ctx.ast, idx);
-
-            // Direct children.
-            for (children.items[0..children.len]) |child| {
-                self.visitNode(ctx, dispatch_table, child, pass_stats, nodes_visited);
-            }
-
-            // First range.
-            if (children.range_end > children.range_start) {
-                for (ctx.ast.extra_data.items[children.range_start..children.range_end]) |raw| {
-                    const child: NodeIndex = @enumFromInt(raw);
+        // Re-read tag after enter passes (a pass may have changed the
+        // node's tag/data layout).  Use childLayout to skip the full
+        // getChildren switch for unary/binary tags.
+        const current_tag = if (enter_range.len > 0) ctx.ast.nodes.items(.tag)[i] else tag;
+        switch (visitor.childLayout(current_tag)) {
+            .leaf => {},
+            .unary => {
+                const data = ctx.ast.nodes.items(.data)[i];
+                self.visitNode(ctx, dispatch_table, data.unary, pass_stats, nodes_visited);
+            },
+            .binary => {
+                const data = ctx.ast.nodes.items(.data)[i];
+                self.visitNode(ctx, dispatch_table, data.binary.lhs, pass_stats, nodes_visited);
+                self.visitNode(ctx, dispatch_table, data.binary.rhs, pass_stats, nodes_visited);
+            },
+            .binary_lhs => {
+                const data = ctx.ast.nodes.items(.data)[i];
+                self.visitNode(ctx, dispatch_table, data.binary.lhs, pass_stats, nodes_visited);
+            },
+            .complex => {
+                const children = visitor.getChildren(ctx.ast, idx);
+                for (children.items[0..children.len]) |child| {
                     self.visitNode(ctx, dispatch_table, child, pass_stats, nodes_visited);
                 }
-            }
-
-            // Second range.
-            if (children.range2_end > children.range2_start) {
-                for (ctx.ast.extra_data.items[children.range2_start..children.range2_end]) |raw| {
-                    const child: NodeIndex = @enumFromInt(raw);
-                    self.visitNode(ctx, dispatch_table, child, pass_stats, nodes_visited);
+                if (children.range_end > children.range_start) {
+                    for (ctx.ast.extra_data.items[children.range_start..children.range_end]) |raw| {
+                        self.visitNode(ctx, dispatch_table, @enumFromInt(raw), pass_stats, nodes_visited);
+                    }
                 }
-            }
+                if (children.range2_end > children.range2_start) {
+                    for (ctx.ast.extra_data.items[children.range2_start..children.range2_end]) |raw| {
+                        self.visitNode(ctx, dispatch_table, @enumFromInt(raw), pass_stats, nodes_visited);
+                    }
+                }
+            },
         }
 
         // ── Exit passes ──────────────────────────────────────────────
-        // Re-read tag in case enter passes modified it.
-        const exit_tag = ctx.ast.nodes.items(.tag)[@intFromEnum(idx)];
-
-        for (dispatch_table.exitForTag(exit_tag)) |pass_index| {
-            const pass = self.passes.items[pass_index];
-            const exit_fn = pass.exit orelse continue;
-            const result = if (pass_stats) |stats| blk: {
-                const started_ns = monotonicNowNs();
-                const visit_result = exit_fn(idx, ctx);
-                stats[pass_index].total_ns += monotonicNsDelta(started_ns, monotonicNowNs()) orelse 0;
-                stats[pass_index].exit_calls += 1;
-                break :blk visit_result;
-            } else exit_fn(idx, ctx);
-            switch (result) {
-                .remove_node => {
-                    ast_ops.removeNode(ctx.ast, idx);
-                    return;
-                },
-                .skip_children, .continue_traversal => {},
+        const exit_tag_idx = @intFromEnum(current_tag);
+        const exit_range = dispatch_table.exit_ranges[exit_tag_idx];
+        if (exit_range.len > 0) {
+            for (dispatch_table.exit_indices[exit_range.start .. exit_range.start + exit_range.len]) |pass_index| {
+                const pass = self.passes.items[pass_index];
+                const exit_fn = pass.exit orelse continue;
+                const result = if (pass_stats) |stats| blk: {
+                    const started_ns = monotonicNowNs();
+                    const visit_result = exit_fn(idx, ctx);
+                    stats[pass_index].total_ns += monotonicNsDelta(started_ns, monotonicNowNs()) orelse 0;
+                    stats[pass_index].exit_calls += 1;
+                    break :blk visit_result;
+                } else exit_fn(idx, ctx);
+                switch (result) {
+                    .remove_node => {
+                        ast_ops.removeNode(ctx.ast, idx);
+                        return;
+                    },
+                    .skip_children, .continue_traversal => {},
+                }
             }
         }
     }
