@@ -43,9 +43,50 @@ pub const TransformSession = struct {
     // First 4 slices init to maxInt(u32), last 2 init to 0.
     const slices_with_max_init = 4;
     const total_slices = 6;
+    /// Number of slices allocated only when no pre-built data is available from scope.
+    const own_only_slices = 2; // fn_binding_name + resolved_binding
 
     pub fn init(allocator: Allocator, ast: *Ast, scope: ?*scope_mod.ScopeResult) !TransformSession {
         const node_count = ast.nodes.len;
+
+        // Check if scope analysis pre-built parent/fn_boundary/preorder data.
+        const has_prebuilt = if (scope) |s| s.session_data_block.len > 0 else false;
+
+        if (has_prebuilt) {
+            // Reuse scope's pre-built arrays; allocate only fn_binding_name + resolved_binding.
+            const sd = scope.?.session_data_block;
+            const block = try allocator.alloc(u32, own_only_slices * node_count);
+            errdefer allocator.free(block);
+            @memset(block, std.math.maxInt(u32));
+
+            var session = TransformSession{
+                .ast = ast,
+                .scope = scope,
+                .node_data_block = block,
+                .parent_map = @ptrCast(sd[0..node_count]),
+                .function_boundary_for_node = @ptrCast(sd[node_count .. 2 * node_count]),
+                .function_binding_name_node = @ptrCast(block[0..node_count]),
+                .resolved_binding_for_node = block[node_count .. 2 * node_count],
+                .preorder_start = sd[2 * node_count .. 3 * node_count],
+                .preorder_end = sd[3 * node_count .. 4 * node_count],
+                .function_binding_indices = &.{},
+                .binding_occurrences = &.{},
+                .unresolved_occurrences = .empty,
+                .this_occurrences = .empty,
+            };
+            errdefer session.deinit(allocator);
+
+            try session.initBindingOccurrences(allocator);
+            const estimated_unresolved: u32 = @intCast(@max(node_count / 32, 16));
+            try session.unresolved_occurrences.ensureTotalCapacity(allocator, estimated_unresolved);
+
+            // Only need the linear occurrence scan — skip the full DFS.
+            try session.buildOccurrencesLinear(allocator);
+            session.sortOccurrences();
+            return session;
+        }
+
+        // Fall back to full DFS when no pre-built data.
         const block = try allocator.alloc(u32, total_slices * node_count);
         errdefer allocator.free(block);
 
@@ -234,6 +275,25 @@ pub const TransformSession = struct {
         }
 
         self.sortOccurrences();
+    }
+
+    /// Linear scan to record identifier/this occurrences and function binding names.
+    /// Used when parent_map/fn_boundary/preorder are pre-built by scope analysis.
+    fn buildOccurrencesLinear(self: *TransformSession, allocator: Allocator) Allocator.Error!void {
+        const tags = self.ast.nodes.items(.tag);
+        const node_count = tags.len;
+        for (0..node_count) |raw| {
+            const tag = tags[raw];
+            const node: NodeIndex = @enumFromInt(raw);
+            self.recordFunctionBindingNode(node, tag);
+            if (tag == .identifier) {
+                const current_fn = self.function_boundary_for_node[raw];
+                const fn_or_null: ?NodeIndex = if (current_fn == .none) null else current_fn;
+                try self.recordIdentifierOccurrence(allocator, node, fn_or_null);
+            } else if (tag == .this_expr) {
+                try self.this_occurrences.append(allocator, node);
+            }
+        }
     }
 
     fn initBindingOccurrences(self: *TransformSession, allocator: Allocator) Allocator.Error!void {
