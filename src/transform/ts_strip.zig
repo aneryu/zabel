@@ -120,19 +120,22 @@ pub fn createPass(config: TsStripConfig) Pass {
 fn enterNode(idx: NodeIndex, ctx: *TransformContext) visitor.VisitResult {
     const tag = ctx.nodeTag(idx);
 
+    if (tag == .program) {
+        ctx.had_ts_strip_pass = true;
+        if (!ctx.ast.language.isTypeScript()) return .continue_traversal;
+        scanImportUsage(ctx);
+        // Bulk-clear dense TS side tables so per-node removes for
+        // identifiers, declarators, patterns, and call-sites are
+        // unnecessary (those tags are no longer in node_filter).
+        bulkClearTsSideTables(ctx);
+        return .continue_traversal;
+    }
+
+    // Non-TS files: side tables are unpopulated and TS-specific syntax is
+    // absent, so every handler below would be a no-op.
+    if (!ctx.ast.language.isTypeScript()) return .continue_traversal;
+
     switch (tag) {
-        // ────────────────────────────────────────────────────────────
-        // Pre-scan: trigger import usage analysis on program enter
-        // ────────────────────────────────────────────────────────────
-        .program => {
-            scanImportUsage(ctx);
-            ctx.had_ts_strip_pass = true;
-            // Bulk-clear dense TS side tables so per-node removes for
-            // identifiers, declarators, patterns, and call-sites are
-            // unnecessary (those tags are no longer in node_filter).
-            bulkClearTsSideTables(ctx);
-            return .continue_traversal;
-        },
 
         // ────────────────────────────────────────────────────────────
         // A) Remove entire node — pure type declarations
@@ -363,6 +366,7 @@ fn enterNode(idx: NodeIndex, ctx: *TransformContext) visitor.VisitResult {
 }
 
 fn exitNode(idx: NodeIndex, ctx: *TransformContext) visitor.VisitResult {
+    if (!ctx.ast.language.isTypeScript()) return .continue_traversal;
     const tag = ctx.nodeTag(idx);
     switch (tag) {
         .program => sanitizeTypeScriptReplacementSources(ctx),
@@ -4979,6 +4983,11 @@ fn scanImportUsage(ctx: *TransformContext) void {
     collectTypeOnlyDecls(ctx);
 
     if (ctx.all_import_names.count() == 0) return;
+
+    // Fast path: non-TS files cannot have type-position-only usages.
+    // If no explicit `import type` was found, all imports are value imports
+    // and the expensive value-usage scan can be skipped entirely.
+    if (!ctx.ast.language.isTypeScript() and ctx.type_only_imports.count() == 0) return;
 
     // Step 2: Collect names that are defined locally (shadow imports).
     // These override the import binding, so uses of the name should NOT

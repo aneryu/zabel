@@ -54,10 +54,19 @@
 - `core` tier A/B (10 iterations, interleaved): baseline `167.3M ns` → optimized `143.1M ns` (**−14.5%**). Per-file pipeline_ns improvements: AnimatedImplementation.js −17.8%, AnimatedValue.js −16.8%, PanResponder.js −19.2%, Form.js −11.6%, InternalTable.js −16.4%, useSelection.js −19.1%.
 - Also attempted iterative session DFS (explicit stack replacing recursive `visitNode`): reverted after benchmarks showed net regression due to worse cache locality from stack entry memory competing with AST data.
 
+- Fixed `transform_bench` to detect file language from extension (`languageFromPath`): `.js`→javascript, `.jsx`→jsx, `.ts`→typescript, `.tsx`→tsx. Previously all files were parsed as `.typescript` regardless of extension, causing unnecessary TS-specific work on `.js` files.
+- Added `parseSource()` accepting an explicit language parameter; `parseTs()` retained for generated-TS benchmarks (stages, phases, profile).
+- ts_strip `enterNode`: for non-TS files, skip `scanImportUsage()` and `bulkClearTsSideTables()` at `.program` enter (still sets `had_ts_strip_pass = true`); early-return for all other tags via `!ctx.ast.language.isTypeScript()`.
+- ts_strip `exitNode`: early-return for non-TS files.
+- ts_strip `scanImportUsage`: fast-path skip of value-usage scan when language is non-TS and no explicit `import type` declarations found.
+- `core` tier A/B (10 iterations, interleaved): baseline `145.5M ns` → optimized `115.3M ns` (**−20.8%**). All 6 `.js` files improved; ts_strip pass time on `AnimatedImplementation.js` dropped from `5.4M ns` to `285K ns` (−95%). Traversal_ns on `AnimatedImplementation.js` dropped from `8.9M` to `2.6M` (−71%).
+- Investigated scope analysis / session DFS merge — confirmed prior finding that combined DFS regresses due to L2 cache pressure (246 KB combined working set vs ~62 KB + ~185 KB separately).
+- Investigated micro-optimizations in `Pipeline.visitNode` dispatch loop — remaining overhead is dominated by cache misses in recursive DFS; no further low-cost gains found.
+
 ## Likely Next Steps
 
-- `scope_analysis_ns` (~8.5M) is still significant; the `findVisibleBindingIndex` hash lookup + scope-chain walk for each identifier is the per-node bottleneck — a name→binding cache updated on scope push/pop could eliminate many repeated lookups.
-- Merging the parent/preorder traversal into scope analysis would eliminate the second full-AST walk, saving ~5-7M ns, but requires coupling scope analysis to TransformSession data structures.
+- Remaining hotspots: `scope_analysis_ns` (~37%), `transform_session_ns` (~26%), `traversal_ns` (~33%) of pipeline. These are proportional to node count and hard to optimize further without fundamental restructuring.
+- `block_scoping` (~1M ns on useSelection.js) and `arrow_functions` (~538K ns) are now the most expensive individual passes; their per-call cost reflects real transformation work.
 - Apply `exit_filter` to other passes that have broad enter filters but narrow exit behavior.
 - Keep removing pass-local structural or lookup caches when equivalent session-backed data already exists.
 - Treat `core` before/after measurements as the acceptance metric; use `full` as a confirmation run after material shared-infrastructure changes.
@@ -87,3 +96,6 @@
 - 2026-04-24: `zig build conformance-test` completed: parser `5891 pass / 0 fail`, codegen `486 pass / 0 fail`, transform `832 pass / 2 fail` (same 2 pre-existing failures).
 - 2026-04-24: `zig build test` passed after deferred comment attachment.
 - 2026-04-24: `zig build conformance-test` completed: parser `5891 pass / 0 fail`, codegen `486 pass / 0 fail`, transform `832 pass / 2 fail` (same 2 pre-existing failures).
+- 2026-04-24: `zig build test` passed after language detection fix + ts_strip non-TS early returns.
+- 2026-04-24: `zig build conformance-test` completed: parser `5891 pass / 0 fail`, codegen `486 pass / 0 fail`, transform `832 pass / 2 fail` (same 2 pre-existing failures).
+- 2026-04-24: `core` tier A/B benchmark (10 iterations, interleaved): baseline `145.5M ns` → optimized `115.3M ns` (−20.8%). Confirmed across 3 separate A/B runs (−20.78%, −20.50%, −20.78%).
