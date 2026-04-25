@@ -9,6 +9,12 @@ const Allocator = std.mem.Allocator;
 
 // ── Public Types ─────────────────────────────────────────────────────
 
+pub const IdentifierOccurrence = struct {
+    node: NodeIndex,
+    function_boundary: ?NodeIndex,
+    start: u32,
+};
+
 pub const ScopeIndex = enum(u32) { root = 0, _ };
 
 pub const ScopeKind = enum {
@@ -148,10 +154,15 @@ pub const ScopeResult = struct {
     dense_map_block: []u32 = &.{},
     /// Pre-computed containing function scope for each scope index.
     containing_fn_scope: []const ScopeIndex = &.{},
-    /// Pre-built session data block (parent_map, fn_boundary, preorder_start, preorder_end).
+    /// Pre-built session data block:
+    /// [parent_map | fn_boundary | fn_binding_name | resolved_binding | preorder_start | preorder_end].
     /// Populated when AnalyzeOptions.build_session_data is true. Ownership
     /// transferred to TransformSession on consumption (set to &.{} after).
     session_data_block: []u32 = &.{},
+    /// Pre-built occurrence data (populated with build_session_data).
+    session_binding_occurrences: []std.ArrayListUnmanaged(IdentifierOccurrence) = &.{},
+    session_unresolved_occurrences: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(IdentifierOccurrence)) = .empty,
+    session_this_occurrences: std.ArrayListUnmanaged(NodeIndex) = .empty,
     allocator: Allocator,
 
     pub fn deinit(self: *ScopeResult) void {
@@ -172,6 +183,13 @@ pub const ScopeResult = struct {
         }
         if (self.containing_fn_scope.len > 0) self.allocator.free(self.containing_fn_scope);
         if (self.session_data_block.len > 0) self.allocator.free(self.session_data_block);
+        // Free occurrence data if not yet consumed by TransformSession.
+        for (self.session_binding_occurrences) |*occ| occ.deinit(self.allocator);
+        if (self.session_binding_occurrences.len > 0) self.allocator.free(self.session_binding_occurrences);
+        var unresolved_iter = self.session_unresolved_occurrences.valueIterator();
+        while (unresolved_iter.next()) |occ| occ.deinit(self.allocator);
+        self.session_unresolved_occurrences.deinit(self.allocator);
+        self.session_this_occurrences.deinit(self.allocator);
     }
 
     pub fn containingFunctionScope(self: *const ScopeResult, scope_idx: ScopeIndex) ScopeIndex {
@@ -217,9 +235,15 @@ pub fn analyzeWithOptions(ast: *const Ast, allocator: Allocator, options: Analyz
     // Pre-compute containing function scope for each scope.
     const containing_fn_scope = try buildContainingFnScope(allocator, scopes);
 
-    // Transfer session data block ownership if built.
+    // Transfer session data block and occurrence data ownership if built.
     const session_data_block = builder.sd_block;
     builder.sd_block = &.{};
+    const session_binding_occurrences = builder.sd_binding_occurrences;
+    builder.sd_binding_occurrences = &.{};
+    const session_unresolved_occurrences = builder.sd_unresolved_occurrences;
+    builder.sd_unresolved_occurrences = .empty;
+    const session_this_occurrences = builder.sd_this_occurrences;
+    builder.sd_this_occurrences = .empty;
 
     return ScopeResult{
         .scopes = scopes,
@@ -232,6 +256,9 @@ pub fn analyzeWithOptions(ast: *const Ast, allocator: Allocator, options: Analyz
         .dense_map_block = dense_map_block,
         .containing_fn_scope = containing_fn_scope,
         .session_data_block = session_data_block,
+        .session_binding_occurrences = session_binding_occurrences,
+        .session_unresolved_occurrences = session_unresolved_occurrences,
+        .session_this_occurrences = session_this_occurrences,
         .allocator = allocator,
     };
 }
@@ -414,15 +441,22 @@ const Builder = struct {
     options: AnalyzeOptions,
 
     // ── Optional session data tracking (active when build_session_data=true) ──
-    /// Combined block: [parent_map | fn_boundary | preorder_start | preorder_end].
+    /// Combined block: [parent_map | fn_boundary | fn_binding_name | resolved_binding | preorder_start | preorder_end].
     sd_block: []u32 = &.{},
     sd_parent_map: []u32 = &.{},
     sd_fn_boundary: []u32 = &.{},
+    sd_fn_binding_name: []u32 = &.{},
+    sd_resolved_binding: []u32 = &.{},
     sd_preorder_start: []u32 = &.{},
     sd_preorder_end: []u32 = &.{},
     sd_cursor: u32 = 0,
     sd_current_parent: NodeIndex = .none,
     sd_current_fn: NodeIndex = .none,
+    sd_binding_occurrences: []std.ArrayListUnmanaged(IdentifierOccurrence) = &.{},
+    sd_unresolved_occurrences: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(IdentifierOccurrence)) = .empty,
+    sd_this_occurrences: std.ArrayListUnmanaged(NodeIndex) = .empty,
+    /// Flat list of resolved identifier node indices (for post-DFS distribution).
+    sd_resolved_ids: std.ArrayListUnmanaged(u32) = .empty,
 
     fn init(ast: *const Ast, allocator: Allocator, options: AnalyzeOptions) Builder {
         return .{
@@ -462,6 +496,14 @@ const Builder = struct {
         self.fn_scope_depth_stack.deinit(self.allocator);
         // sd_block ownership is transferred to ScopeResult; free only if still owned.
         if (self.sd_block.len > 0) self.allocator.free(self.sd_block);
+        // Occurrence data ownership is transferred; free only if still owned.
+        for (self.sd_binding_occurrences) |*occ| occ.deinit(self.allocator);
+        if (self.sd_binding_occurrences.len > 0) self.allocator.free(self.sd_binding_occurrences);
+        var sd_unresolved_iter = self.sd_unresolved_occurrences.valueIterator();
+        while (sd_unresolved_iter.next()) |occ| occ.deinit(self.allocator);
+        self.sd_unresolved_occurrences.deinit(self.allocator);
+        self.sd_this_occurrences.deinit(self.allocator);
+        self.sd_resolved_ids.deinit(self.allocator);
     }
 
     fn takeMutationData(self: *Builder, allocator: Allocator) !struct { offsets: []u32, nodes: []u32 } {
@@ -503,15 +545,21 @@ const Builder = struct {
 
         // Allocate session data arrays if requested.
         if (self.options.build_session_data) {
-            // Layout: [parent_map | fn_boundary | preorder_start | preorder_end]
-            // parent_map and fn_boundary init to maxInt (.none), preorder to 0.
-            self.sd_block = try self.allocator.alloc(u32, node_count * 4);
+            // Layout: [parent_map | fn_boundary | fn_binding_name | resolved_binding | preorder_start | preorder_end]
+            // First 4 slices init to maxInt(u32), last 2 to 0.
+            self.sd_block = try self.allocator.alloc(u32, node_count * 6);
             self.sd_parent_map = self.sd_block[0..node_count];
             self.sd_fn_boundary = self.sd_block[node_count .. 2 * node_count];
-            self.sd_preorder_start = self.sd_block[2 * node_count .. 3 * node_count];
-            self.sd_preorder_end = self.sd_block[3 * node_count .. 4 * node_count];
-            @memset(self.sd_block[0 .. 2 * node_count], std.math.maxInt(u32));
-            @memset(self.sd_block[2 * node_count ..], 0);
+            self.sd_fn_binding_name = self.sd_block[2 * node_count .. 3 * node_count];
+            self.sd_resolved_binding = self.sd_block[3 * node_count .. 4 * node_count];
+            self.sd_preorder_start = self.sd_block[4 * node_count .. 5 * node_count];
+            self.sd_preorder_end = self.sd_block[5 * node_count .. 6 * node_count];
+            @memset(self.sd_block[0 .. 4 * node_count], std.math.maxInt(u32));
+            @memset(self.sd_block[4 * node_count ..], 0);
+
+            // Pre-size unresolved occurrences hash map.
+            const estimated_unresolved: u32 = @intCast(@max(node_count / 32, 16));
+            try self.sd_unresolved_occurrences.ensureTotalCapacity(self.allocator, estimated_unresolved);
         }
 
         // Create root scope
@@ -525,6 +573,37 @@ const Builder = struct {
         // Finalize the root scope's bindings_end
         self.finalizeCurrentScope();
         self.popScope();
+
+        // Build per-binding occurrence lists from resolved_binding markers.
+        if (self.options.build_session_data) {
+            try self.buildBindingOccurrences();
+        }
+    }
+
+    /// Post-DFS pass: distribute resolved identifiers into per-binding occurrence lists.
+    fn buildBindingOccurrences(self: *Builder) Allocator.Error!void {
+        const binding_count = self.bindings.items.len;
+        self.sd_binding_occurrences = try self.allocator.alloc(
+            std.ArrayListUnmanaged(IdentifierOccurrence),
+            binding_count,
+        );
+        for (self.sd_binding_occurrences) |*occ| occ.* = .empty;
+
+        const main_tokens = self.ast.nodes.items(.main_token);
+        const token_starts = self.ast.tokens.items(.start);
+        const fn_boundary_none = std.math.maxInt(u32);
+
+        for (self.sd_resolved_ids.items) |raw| {
+            const bid = self.sd_resolved_binding[raw];
+            const mt = main_tokens[raw];
+            const fn_raw = self.sd_fn_boundary[raw];
+            const fn_boundary: ?NodeIndex = if (fn_raw == fn_boundary_none) null else @enumFromInt(fn_raw);
+            try self.sd_binding_occurrences[bid].append(self.allocator, .{
+                .node = @enumFromInt(raw),
+                .function_boundary = fn_boundary,
+                .start = token_starts[@intFromEnum(mt)],
+            });
+        }
     }
 
     fn currentScope(self: *const Builder) ScopeIndex {
@@ -696,7 +775,12 @@ const Builder = struct {
 
         // Leaf tags have no children; only .identifier needs binding resolution.
         if (visitor.isLeafTag(tag)) {
-            if (tag == .identifier) self.visitIdentifierRef(idx);
+            if (tag == .identifier) {
+                const binding_idx = self.visitIdentifierRef(idx);
+                if (sd_active) try self.recordIdentifierOccurrence(idx, binding_idx);
+            } else if (sd_active and tag == .this_expr) {
+                try self.sd_this_occurrences.append(self.allocator, idx);
+            }
             if (sd_active) {
                 self.sd_preorder_end[i] = self.sd_cursor;
                 self.sd_current_parent = sd_saved_parent;
@@ -773,8 +857,11 @@ const Builder = struct {
             else => try self.visitChildren(idx, tag, data),
         }
 
-        // ── Session data finalize ────────────────────────────────
+        // ── Session data: record function binding names ───────
         if (sd_active) {
+            if (tag == .declarator or tag == .assignment_expr) {
+                self.recordFunctionBindingNode(idx, data);
+            }
             self.sd_preorder_end[i] = self.sd_cursor;
             self.sd_current_parent = sd_saved_parent;
             self.sd_current_fn = sd_saved_fn;
@@ -1273,16 +1360,51 @@ const Builder = struct {
         self.popScope();
     }
 
-    fn visitIdentifierRef(self: *Builder, idx: NodeIndex) void {
+    fn visitIdentifierRef(self: *Builder, idx: NodeIndex) ?u32 {
         const i = @intFromEnum(idx);
         const mt = self.ast.nodes.items(.main_token)[i];
         const name = self.ast.tokenSlice(mt);
 
-        const binding_idx = self.findVisibleBindingIndex(name) orelse return;
+        const binding_idx = self.findVisibleBindingIndex(name) orelse return null;
         self.node_to_binding.putDirect(i, binding_idx);
         if (self.crossesFunctionBoundary(self.bindings.items[binding_idx].scope)) {
             self.bindings.items[binding_idx].is_captured = true;
         }
+        return binding_idx;
+    }
+
+    fn recordIdentifierOccurrence(self: *Builder, idx: NodeIndex, binding_idx: ?u32) Allocator.Error!void {
+        const i = @intFromEnum(idx);
+        if (binding_idx) |bid| {
+            self.sd_resolved_binding[i] = bid;
+            try self.sd_resolved_ids.append(self.allocator, @intCast(i));
+            return;
+        }
+        // Unresolved identifier: record occurrence directly.
+        const mt = self.ast.nodes.items(.main_token)[i];
+        const fn_boundary = self.sd_current_fn;
+        const occurrence: IdentifierOccurrence = .{
+            .node = idx,
+            .function_boundary = if (fn_boundary == .none) null else fn_boundary,
+            .start = self.ast.tokens.items(.start)[@intFromEnum(mt)],
+        };
+        const name = self.ast.tokenSlice(mt);
+        const gop = try self.sd_unresolved_occurrences.getOrPut(self.allocator, name);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(self.allocator, occurrence);
+    }
+
+    fn recordFunctionBindingNode(self: *Builder, _: NodeIndex, data: Node.Data) void {
+        const lhs = data.binary.lhs;
+        const rhs = data.binary.rhs;
+        if (lhs == .none or rhs == .none) return;
+        if (self.ast.nodes.items(.tag)[@intFromEnum(lhs)] != .identifier) return;
+        const rhs_tag = self.ast.nodes.items(.tag)[@intFromEnum(rhs)];
+        switch (rhs_tag) {
+            .arrow_function_expr, .function_expr => {},
+            else => return,
+        }
+        self.sd_fn_binding_name[@intFromEnum(rhs)] = @intFromEnum(lhs);
     }
 
     fn visitAssignment(self: *Builder, idx: NodeIndex, data: Node.Data) !void {
