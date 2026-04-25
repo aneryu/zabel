@@ -191,10 +191,20 @@ pub const TransformSession = struct {
 
     fn ensureFunctionBindingIndices(self: *TransformSession) Allocator.Error!void {
         if (self.function_binding_indices_built) return;
-        const scope = self.scope orelse return;
+        const scope = self.scope orelse {
+            // No scope: nothing to build; mark as built so we don't repeatedly
+            // re-check on every functionBindingIndices call.
+            self.function_binding_indices_built = true;
+            return;
+        };
         const allocator = scope.allocator;
         self.function_binding_indices = try allocator.alloc(FunctionBindingIndexMap, scope.scopes.len);
         for (self.function_binding_indices) |*map| map.* = .{};
+        // Mark as built before population: any partial allocations are owned
+        // by `function_binding_indices` and will be cleaned up by `deinit`.
+        // Without this, an OOM mid-loop would leave a partial allocation that
+        // a retry call would overwrite, leaking the previous array.
+        self.function_binding_indices_built = true;
 
         for (scope.bindings, 0..) |binding, binding_idx| {
             const owner_scope_idx = scope.containingFunctionScope(binding.scope);
@@ -208,7 +218,6 @@ pub const TransformSession = struct {
             }
             try gop.value_ptr.append(allocator, @intCast(binding_idx));
         }
-        self.function_binding_indices_built = true;
     }
 
     fn buildParentAndRanges(self: *TransformSession, allocator: Allocator) Allocator.Error!void {
