@@ -148,6 +148,7 @@ fn languageFromPath(path: []const u8) zb.Language {
     if (std.mem.endsWith(u8, path, ".tsx")) return .tsx;
     if (std.mem.endsWith(u8, path, ".ts")) return .typescript;
     if (std.mem.endsWith(u8, path, ".jsx")) return .jsx;
+    if (std.mem.endsWith(u8, path, ".flow.js")) return .flow;
     return .javascript;
 }
 

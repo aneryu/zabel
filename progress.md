@@ -99,3 +99,6 @@
 - 2026-04-24: `zig build test` passed after language detection fix + ts_strip non-TS early returns.
 - 2026-04-24: `zig build conformance-test` completed: parser `5891 pass / 0 fail`, codegen `486 pass / 0 fail`, transform `832 pass / 2 fail` (same 2 pre-existing failures).
 - 2026-04-24: `core` tier A/B benchmark (10 iterations, interleaved): baseline `145.5M ns` → optimized `115.3M ns` (−20.8%). Confirmed across 3 separate A/B runs (−20.78%, −20.50%, −20.78%).
+- 2026-04-24: Fixed `languageFromPath` to detect `.flow.js` → `.flow` (previously fell through to `.javascript`). `TextInput.flow.js` in the `full` corpus is now parsed with the Flow parser.
+- 2026-04-24: `zig build test` passed (191/191). `zig build conformance-test` completed: parser `5891 pass / 0 fail`, codegen `486 pass / 0 fail`, transform `832 pass / 2 fail` (same 2 pre-existing failures).
+- 2026-04-24: `core` tier A/B (10 iterations, interleaved) after `.flow.js` fix: no regression (−0.36%, within noise).
