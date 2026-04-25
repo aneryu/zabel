@@ -9,6 +9,12 @@ const Allocator = std.mem.Allocator;
 
 // ── Public Types ─────────────────────────────────────────────────────
 
+pub const IdentifierOccurrence = struct {
+    node: NodeIndex,
+    function_boundary: ?NodeIndex,
+    start: u32,
+};
+
 pub const ScopeIndex = enum(u32) { root = 0, _ };
 
 pub const ScopeKind = enum {
@@ -27,6 +33,7 @@ pub const Scope = struct {
     node: NodeIndex,
     bindings_start: u32,
     bindings_end: u32,
+    depth: u32 = 0,
 };
 
 pub const BindingKind = enum {
@@ -147,6 +154,15 @@ pub const ScopeResult = struct {
     dense_map_block: []u32 = &.{},
     /// Pre-computed containing function scope for each scope index.
     containing_fn_scope: []const ScopeIndex = &.{},
+    /// Pre-built session data block:
+    /// [parent_map | fn_boundary | fn_binding_name | resolved_binding | preorder_start | preorder_end].
+    /// Populated when AnalyzeOptions.build_session_data is true. Ownership
+    /// transferred to TransformSession on consumption (set to &.{} after).
+    session_data_block: []u32 = &.{},
+    /// Pre-built occurrence data (populated with build_session_data).
+    session_binding_occurrences: []std.ArrayListUnmanaged(IdentifierOccurrence) = &.{},
+    session_unresolved_occurrences: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(IdentifierOccurrence)) = .empty,
+    session_this_occurrences: std.ArrayListUnmanaged(NodeIndex) = .empty,
     allocator: Allocator,
 
     pub fn deinit(self: *ScopeResult) void {
@@ -166,6 +182,14 @@ pub const ScopeResult = struct {
             self.node_to_binding.deinit(self.allocator);
         }
         if (self.containing_fn_scope.len > 0) self.allocator.free(self.containing_fn_scope);
+        if (self.session_data_block.len > 0) self.allocator.free(self.session_data_block);
+        // Free occurrence data if not yet consumed by TransformSession.
+        for (self.session_binding_occurrences) |*occ| occ.deinit(self.allocator);
+        if (self.session_binding_occurrences.len > 0) self.allocator.free(self.session_binding_occurrences);
+        var unresolved_iter = self.session_unresolved_occurrences.valueIterator();
+        while (unresolved_iter.next()) |occ| occ.deinit(self.allocator);
+        self.session_unresolved_occurrences.deinit(self.allocator);
+        self.session_this_occurrences.deinit(self.allocator);
     }
 
     pub fn containingFunctionScope(self: *const ScopeResult, scope_idx: ScopeIndex) ScopeIndex {
@@ -179,6 +203,10 @@ pub const ScopeResult = struct {
 
 pub const AnalyzeOptions = struct {
     extra_globals: []const []const u8 = &.{},
+    /// When true, scope analysis also builds parent_map, fn_boundary,
+    /// preorder_start, and preorder_end arrays as a side-effect of its DFS.
+    /// TransformSession.init can then skip its own DFS pass entirely.
+    build_session_data: bool = false,
 };
 
 pub fn analyze(ast: *const Ast, allocator: Allocator) !ScopeResult {
@@ -207,6 +235,16 @@ pub fn analyzeWithOptions(ast: *const Ast, allocator: Allocator, options: Analyz
     // Pre-compute containing function scope for each scope.
     const containing_fn_scope = try buildContainingFnScope(allocator, scopes);
 
+    // Transfer session data block and occurrence data ownership if built.
+    const session_data_block = builder.sd_block;
+    builder.sd_block = &.{};
+    const session_binding_occurrences = builder.sd_binding_occurrences;
+    builder.sd_binding_occurrences = &.{};
+    const session_unresolved_occurrences = builder.sd_unresolved_occurrences;
+    builder.sd_unresolved_occurrences = .empty;
+    const session_this_occurrences = builder.sd_this_occurrences;
+    builder.sd_this_occurrences = .empty;
+
     return ScopeResult{
         .scopes = scopes,
         .bindings = bindings,
@@ -217,6 +255,10 @@ pub fn analyzeWithOptions(ast: *const Ast, allocator: Allocator, options: Analyz
         .node_to_binding = node_to_binding,
         .dense_map_block = dense_map_block,
         .containing_fn_scope = containing_fn_scope,
+        .session_data_block = session_data_block,
+        .session_binding_occurrences = session_binding_occurrences,
+        .session_unresolved_occurrences = session_unresolved_occurrences,
+        .session_this_occurrences = session_this_occurrences,
         .allocator = allocator,
     };
 }
@@ -394,7 +436,27 @@ const Builder = struct {
     dense_map_block: []u32 = &.{},
     /// Stack of scope indices during traversal
     scope_stack: std.ArrayListUnmanaged(ScopeIndex),
+    /// Stack of depths at which function/arrow scopes were pushed.
+    fn_scope_depth_stack: std.ArrayListUnmanaged(u32),
     options: AnalyzeOptions,
+
+    // ── Optional session data tracking (active when build_session_data=true) ──
+    /// Combined block: [parent_map | fn_boundary | fn_binding_name | resolved_binding | preorder_start | preorder_end].
+    sd_block: []u32 = &.{},
+    sd_parent_map: []u32 = &.{},
+    sd_fn_boundary: []u32 = &.{},
+    sd_fn_binding_name: []u32 = &.{},
+    sd_resolved_binding: []u32 = &.{},
+    sd_preorder_start: []u32 = &.{},
+    sd_preorder_end: []u32 = &.{},
+    sd_cursor: u32 = 0,
+    sd_current_parent: NodeIndex = .none,
+    sd_current_fn: NodeIndex = .none,
+    sd_binding_occurrences: []std.ArrayListUnmanaged(IdentifierOccurrence) = &.{},
+    sd_unresolved_occurrences: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(IdentifierOccurrence)) = .empty,
+    sd_this_occurrences: std.ArrayListUnmanaged(NodeIndex) = .empty,
+    /// Flat list of resolved identifier node indices (for post-DFS distribution).
+    sd_resolved_ids: std.ArrayListUnmanaged(u32) = .empty,
 
     fn init(ast: *const Ast, allocator: Allocator, options: AnalyzeOptions) Builder {
         return .{
@@ -407,6 +469,7 @@ const Builder = struct {
             .node_to_scope = .{},
             .node_to_binding = .{},
             .scope_stack = .empty,
+            .fn_scope_depth_stack = .empty,
             .options = options,
         };
     }
@@ -430,6 +493,17 @@ const Builder = struct {
             self.node_to_binding.deinit(self.allocator);
         }
         self.scope_stack.deinit(self.allocator);
+        self.fn_scope_depth_stack.deinit(self.allocator);
+        // sd_block ownership is transferred to ScopeResult; free only if still owned.
+        if (self.sd_block.len > 0) self.allocator.free(self.sd_block);
+        // Occurrence data ownership is transferred; free only if still owned.
+        for (self.sd_binding_occurrences) |*occ| occ.deinit(self.allocator);
+        if (self.sd_binding_occurrences.len > 0) self.allocator.free(self.sd_binding_occurrences);
+        var sd_unresolved_iter = self.sd_unresolved_occurrences.valueIterator();
+        while (sd_unresolved_iter.next()) |occ| occ.deinit(self.allocator);
+        self.sd_unresolved_occurrences.deinit(self.allocator);
+        self.sd_this_occurrences.deinit(self.allocator);
+        self.sd_resolved_ids.deinit(self.allocator);
     }
 
     fn takeMutationData(self: *Builder, allocator: Allocator) !struct { offsets: []u32, nodes: []u32 } {
@@ -469,6 +543,25 @@ const Builder = struct {
         self.node_to_scope.values = self.dense_map_block[0..node_count];
         self.node_to_binding.values = self.dense_map_block[node_count .. node_count * 2];
 
+        // Allocate session data arrays if requested.
+        if (self.options.build_session_data) {
+            // Layout: [parent_map | fn_boundary | fn_binding_name | resolved_binding | preorder_start | preorder_end]
+            // First 4 slices init to maxInt(u32), last 2 to 0.
+            self.sd_block = try self.allocator.alloc(u32, node_count * 6);
+            self.sd_parent_map = self.sd_block[0..node_count];
+            self.sd_fn_boundary = self.sd_block[node_count .. 2 * node_count];
+            self.sd_fn_binding_name = self.sd_block[2 * node_count .. 3 * node_count];
+            self.sd_resolved_binding = self.sd_block[3 * node_count .. 4 * node_count];
+            self.sd_preorder_start = self.sd_block[4 * node_count .. 5 * node_count];
+            self.sd_preorder_end = self.sd_block[5 * node_count .. 6 * node_count];
+            @memset(self.sd_block[0 .. 4 * node_count], std.math.maxInt(u32));
+            @memset(self.sd_block[4 * node_count ..], 0);
+
+            // Pre-size unresolved occurrences hash map.
+            const estimated_unresolved: u32 = @intCast(@max(node_count / 32, 16));
+            try self.sd_unresolved_occurrences.ensureTotalCapacity(self.allocator, estimated_unresolved);
+        }
+
         // Create root scope
         const root_kind: ScopeKind = if (self.ast.source_type == .module) .module else .global;
         _ = try self.pushScope(root_kind, @enumFromInt(0));
@@ -479,7 +572,38 @@ const Builder = struct {
 
         // Finalize the root scope's bindings_end
         self.finalizeCurrentScope();
-        _ = self.scope_stack.pop();
+        self.popScope();
+
+        // Build per-binding occurrence lists from resolved_binding markers.
+        if (self.options.build_session_data) {
+            try self.buildBindingOccurrences();
+        }
+    }
+
+    /// Post-DFS pass: distribute resolved identifiers into per-binding occurrence lists.
+    fn buildBindingOccurrences(self: *Builder) Allocator.Error!void {
+        const binding_count = self.bindings.items.len;
+        self.sd_binding_occurrences = try self.allocator.alloc(
+            std.ArrayListUnmanaged(IdentifierOccurrence),
+            binding_count,
+        );
+        for (self.sd_binding_occurrences) |*occ| occ.* = .empty;
+
+        const main_tokens = self.ast.nodes.items(.main_token);
+        const token_starts = self.ast.tokens.items(.start);
+        const fn_boundary_none = std.math.maxInt(u32);
+
+        for (self.sd_resolved_ids.items) |raw| {
+            const bid = self.sd_resolved_binding[raw];
+            const mt = main_tokens[raw];
+            const fn_raw = self.sd_fn_boundary[raw];
+            const fn_boundary: ?NodeIndex = if (fn_raw == fn_boundary_none) null else @enumFromInt(fn_raw);
+            try self.sd_binding_occurrences[bid].append(self.allocator, .{
+                .node = @enumFromInt(raw),
+                .function_boundary = fn_boundary,
+                .start = token_starts[@intFromEnum(mt)],
+            });
+        }
     }
 
     fn currentScope(self: *const Builder) ScopeIndex {
@@ -489,16 +613,29 @@ const Builder = struct {
     fn pushScope(self: *Builder, kind: ScopeKind, node: NodeIndex) !ScopeIndex {
         const idx: ScopeIndex = @enumFromInt(@as(u32, @intCast(self.scopes.items.len)));
         const parent: ?ScopeIndex = if (self.scope_stack.items.len > 0) self.currentScope() else null;
+        const depth: u32 = @intCast(self.scope_stack.items.len);
         try self.scopes.append(self.allocator, .{
             .parent = parent,
             .kind = kind,
             .node = node,
             .bindings_start = @intCast(self.bindings.items.len),
             .bindings_end = @intCast(self.bindings.items.len),
+            .depth = depth,
         });
         try self.scope_stack.append(self.allocator, idx);
         self.node_to_scope.putDirect(@intFromEnum(node), idx);
+        if (kind == .function or kind == .arrow) {
+            try self.fn_scope_depth_stack.append(self.allocator, depth);
+        }
         return idx;
+    }
+
+    fn popScope(self: *Builder) void {
+        const scope_idx = self.scope_stack.pop().?;
+        const kind = self.scopes.items[@intFromEnum(scope_idx)].kind;
+        if (kind == .function or kind == .arrow) {
+            _ = self.fn_scope_depth_stack.pop();
+        }
     }
 
     fn finalizeCurrentScope(self: *Builder) void {
@@ -567,28 +704,36 @@ const Builder = struct {
 
     /// Check if an identifier node is across a function boundary from the binding scope.
     fn crossesFunctionBoundary(self: *const Builder, binding_scope: ScopeIndex) bool {
-        // Walk up from current scope to binding_scope; if we pass a function/arrow scope, it's captured
-        var i: usize = self.scope_stack.items.len;
-        while (i > 0) {
-            i -= 1;
-            const idx = self.scope_stack.items[i];
-            if (@intFromEnum(idx) == @intFromEnum(binding_scope)) return false;
-            const kind = self.scopes.items[@intFromEnum(idx)].kind;
-            switch (kind) {
-                .function, .arrow => return true,
-                else => {},
-            }
-        }
-        return false;
+        const binding_depth = self.scopes.items[@intFromEnum(binding_scope)].depth;
+        const fn_stack = self.fn_scope_depth_stack.items;
+        if (fn_stack.len == 0) return false;
+        const deepest_fn_depth = fn_stack[fn_stack.len - 1];
+        return deepest_fn_depth > binding_depth;
+    }
+
+    fn isFunctionBoundaryTag(tag: Node.Tag) bool {
+        return switch (tag) {
+            .function_declaration,
+            .async_function_declaration,
+            .generator_declaration,
+            .async_generator_declaration,
+            .function_expr,
+            .arrow_function_expr,
+            .method_definition,
+            .computed_method,
+            .class_method,
+            .class_private_method,
+            .getter,
+            .setter,
+            => true,
+            else => false,
+        };
     }
 
     fn isScopeVisibleFromCurrent(self: *const Builder, candidate_scope: ScopeIndex) bool {
-        var current: ?ScopeIndex = self.currentScope();
-        while (current) |scope_idx| {
-            if (scope_idx == candidate_scope) return true;
-            current = self.scopes.items[@intFromEnum(scope_idx)].parent;
-        }
-        return false;
+        const candidate_depth = self.scopes.items[@intFromEnum(candidate_scope)].depth;
+        if (candidate_depth >= self.scope_stack.items.len) return false;
+        return self.scope_stack.items[candidate_depth] == candidate_scope;
     }
 
     fn findVisibleBindingIndex(self: *const Builder, name: []const u8) ?u32 {
@@ -610,12 +755,37 @@ const Builder = struct {
         const tag = tags[i];
         if (tag == .removed) return;
 
+        // ── Session data tracking ────────────────────────────────
+        const sd_active = self.sd_parent_map.len > 0;
+        var sd_saved_parent: NodeIndex = .none;
+        var sd_saved_fn: NodeIndex = .none;
+        if (sd_active) {
+            self.sd_parent_map[i] = @intFromEnum(self.sd_current_parent);
+            self.sd_fn_boundary[i] = @intFromEnum(self.sd_current_fn);
+            self.sd_preorder_start[i] = self.sd_cursor;
+            self.sd_cursor += 1;
+            sd_saved_parent = self.sd_current_parent;
+            sd_saved_fn = self.sd_current_fn;
+            self.sd_current_parent = idx;
+            if (isFunctionBoundaryTag(tag)) self.sd_current_fn = idx;
+        }
+
         // Map this node to the current scope
         self.node_to_scope.putDirect(i, self.currentScope());
 
         // Leaf tags have no children; only .identifier needs binding resolution.
         if (visitor.isLeafTag(tag)) {
-            if (tag == .identifier) self.visitIdentifierRef(idx);
+            if (tag == .identifier) {
+                const binding_idx = self.visitIdentifierRef(idx);
+                if (sd_active) try self.recordIdentifierOccurrence(idx, binding_idx);
+            } else if (sd_active and tag == .this_expr) {
+                try self.sd_this_occurrences.append(self.allocator, idx);
+            }
+            if (sd_active) {
+                self.sd_preorder_end[i] = self.sd_cursor;
+                self.sd_current_parent = sd_saved_parent;
+                self.sd_current_fn = sd_saved_fn;
+            }
             return;
         }
 
@@ -686,12 +856,21 @@ const Builder = struct {
             // ── Default: recurse into children ───────────────────────
             else => try self.visitChildren(idx, tag, data),
         }
+
+        // ── Session data: record function binding names ───────
+        if (sd_active) {
+            if (tag == .declarator or tag == .assignment_expr) {
+                self.recordFunctionBindingNode(idx, data);
+            }
+            self.sd_preorder_end[i] = self.sd_cursor;
+            self.sd_current_parent = sd_saved_parent;
+            self.sd_current_fn = sd_saved_fn;
+        }
     }
 
     fn visitProperty(self: *Builder, data: Node.Data) !void {
-        // Non-computed object property keys are names, not identifier references.
-        // The value side still contains runtime references in both object literals
-        // and object-pattern assignment targets.
+        // Visit both key and value so session data is set for all children.
+        try self.visit(data.binary.lhs);
         try self.visit(data.binary.rhs);
     }
 
@@ -699,14 +878,8 @@ const Builder = struct {
         const extra_idx = @intFromEnum(data.extra);
         const key: NodeIndex = @enumFromInt(self.ast.extra_data.items[extra_idx]);
         const value: NodeIndex = @enumFromInt(self.ast.extra_data.items[extra_idx + 1]);
-        const flags = if (extra_idx + 2 < self.ast.extra_data.items.len)
-            self.ast.extra_data.items[extra_idx + 2]
-        else
-            0;
-        const is_computed = (flags & 2) != 0;
-        if (is_computed) {
-            try self.visit(key);
-        }
+        // Visit both key and value so session data is set for all children.
+        try self.visit(key);
         try self.visit(value);
     }
 
@@ -778,7 +951,7 @@ const Builder = struct {
         try self.visitBlockBody(body);
 
         self.finalizeCurrentScope();
-        _ = self.scope_stack.pop();
+        self.popScope();
     }
 
     fn visitFunctionExpr(self: *Builder, idx: NodeIndex, data: Node.Data) !void {
@@ -804,7 +977,7 @@ const Builder = struct {
         try self.visitBlockBody(body);
 
         self.finalizeCurrentScope();
-        _ = self.scope_stack.pop();
+        self.popScope();
     }
 
     fn visitArrowFunction(self: *Builder, idx: NodeIndex, data: Node.Data) !void {
@@ -824,6 +997,7 @@ const Builder = struct {
                 const param_node: NodeIndex = @enumFromInt(first);
                 if (param_node != .none) {
                     try self.collectBindingNames(param_node, .param);
+                    try self.visit(param_node);
                 }
                 const body: NodeIndex = @enumFromInt(second);
                 try self.visit(body);
@@ -836,7 +1010,7 @@ const Builder = struct {
         }
 
         self.finalizeCurrentScope();
-        _ = self.scope_stack.pop();
+        self.popScope();
     }
 
     fn visitClassDecl(self: *Builder, idx: NodeIndex, data: Node.Data) !void {
@@ -885,7 +1059,7 @@ const Builder = struct {
         }
 
         self.finalizeCurrentScope();
-        _ = self.scope_stack.pop();
+        self.popScope();
     }
 
     fn visitBlockStatement(self: *Builder, idx: NodeIndex, data: Node.Data) !void {
@@ -971,7 +1145,7 @@ const Builder = struct {
 
         if (!parent_creates_scope) {
             self.finalizeCurrentScope();
-            _ = self.scope_stack.pop();
+            self.popScope();
         }
     }
 
@@ -990,7 +1164,7 @@ const Builder = struct {
         try self.visit(body_node);
 
         self.finalizeCurrentScope();
-        _ = self.scope_stack.pop();
+        self.popScope();
     }
 
     fn visitForInOfStatement(self: *Builder, idx: NodeIndex, data: Node.Data) !void {
@@ -1017,7 +1191,7 @@ const Builder = struct {
         try self.visit(body_node);
 
         self.finalizeCurrentScope();
-        _ = self.scope_stack.pop();
+        self.popScope();
     }
 
     fn visitSwitchStatement(self: *Builder, idx: NodeIndex, data: Node.Data) !void {
@@ -1043,7 +1217,7 @@ const Builder = struct {
         }
 
         self.finalizeCurrentScope();
-        _ = self.scope_stack.pop();
+        self.popScope();
     }
 
     fn visitCatchClause(self: *Builder, idx: NodeIndex, data: Node.Data) !void {
@@ -1059,7 +1233,7 @@ const Builder = struct {
         try self.visit(data.binary.rhs);
 
         self.finalizeCurrentScope();
-        _ = self.scope_stack.pop();
+        self.popScope();
     }
 
     fn visitVarDeclaration(self: *Builder, _: NodeIndex, data: Node.Data, kind: BindingKind) !void {
@@ -1089,8 +1263,9 @@ const Builder = struct {
                     .init_node = decl_data.binary.rhs,
                 });
 
-                // Visit the initializer
-                try self.visit(decl_data.binary.rhs);
+                // Visit declarator so that session data (parent/fn_boundary/preorder)
+                // is set for the declarator node and its children (binding + initializer).
+                try self.visit(decl_idx);
             }
         }
     }
@@ -1111,30 +1286,28 @@ const Builder = struct {
 
                 switch (spec_tag) {
                     .import_specifier, .import_specifier_type, .import_specifier_typeof => {
-                        // import_specifier: extra[0]=imported_token, extra[1]=local_token
                         const spec_data = self.ast.nodes.items(.data)[spec_i];
                         const spec_extra = @intFromEnum(spec_data.extra);
                         const local_token_raw = self.ast.extra_data.items[spec_extra + 1];
                         if (local_token_raw != 0) {
                             const name = self.ast.tokenSlice(@enumFromInt(local_token_raw));
-                            // Module scope for imports
                             try self.addBinding(name, .import_binding, self.scope_stack.items[0], spec_idx, .{ .decl_node = spec_idx });
                         }
                     },
                     .import_default => {
-                        // import_default: main_token = local name
                         const mt = self.ast.nodes.items(.main_token)[spec_i];
                         const name = self.ast.tokenSlice(mt);
                         try self.addBinding(name, .import_binding, self.scope_stack.items[0], spec_idx, .{ .decl_node = spec_idx });
                     },
                     .import_namespace => {
-                        // import_namespace: main_token = local name (the `foo` in `* as foo`)
                         const mt = self.ast.nodes.items(.main_token)[spec_i];
                         const name = self.ast.tokenSlice(mt);
                         try self.addBinding(name, .import_binding, self.scope_stack.items[0], spec_idx, .{ .decl_node = spec_idx });
                     },
                     else => {},
                 }
+                // Visit specifier node so session data is set.
+                try self.visit(spec_idx);
             }
         }
     }
@@ -1144,19 +1317,8 @@ const Builder = struct {
         //   extra[0]=key, [1]=params_start, [2]=params_end, [3]=body
         const extra_idx = @intFromEnum(data.extra);
         const key: NodeIndex = @enumFromInt(self.ast.extra_data.items[extra_idx]);
-        const tag = self.ast.nodes.items(.tag)[@intFromEnum(idx)];
-        const flags = if (extra_idx + 4 < self.ast.extra_data.items.len)
-            self.ast.extra_data.items[extra_idx + 4]
-        else
-            0;
-        const is_computed = switch (tag) {
-            .computed_method => true,
-            .class_method, .class_private_method => (flags & 2) != 0,
-            else => false,
-        };
-        if (is_computed) {
-            try self.visit(key);
-        }
+        // Visit key so session data is set for all children.
+        try self.visit(key);
 
         _ = try self.pushScope(.function, idx);
 
@@ -1168,12 +1330,22 @@ const Builder = struct {
         try self.visitBlockBody(body);
 
         self.finalizeCurrentScope();
-        _ = self.scope_stack.pop();
+        self.popScope();
     }
 
     fn visitGetterSetter(self: *Builder, idx: NodeIndex, data: Node.Data) !void {
         // getter/setter: extra[0]=params_start, [1]=params_end, [2]=body, [3]=flags, [4]=computed_key
         const extra_idx = @intFromEnum(data.extra);
+
+        // Visit computed key before pushing function scope.
+        const flags = if (extra_idx + 3 < self.ast.extra_data.items.len)
+            self.ast.extra_data.items[extra_idx + 3]
+        else
+            0;
+        const is_computed = (flags & 8) != 0;
+        if (is_computed and extra_idx + 4 < self.ast.extra_data.items.len) {
+            try self.visit(@enumFromInt(self.ast.extra_data.items[extra_idx + 4]));
+        }
 
         _ = try self.pushScope(.function, idx);
 
@@ -1185,19 +1357,54 @@ const Builder = struct {
         try self.visitBlockBody(body);
 
         self.finalizeCurrentScope();
-        _ = self.scope_stack.pop();
+        self.popScope();
     }
 
-    fn visitIdentifierRef(self: *Builder, idx: NodeIndex) void {
+    fn visitIdentifierRef(self: *Builder, idx: NodeIndex) ?u32 {
         const i = @intFromEnum(idx);
         const mt = self.ast.nodes.items(.main_token)[i];
         const name = self.ast.tokenSlice(mt);
 
-        const binding_idx = self.findVisibleBindingIndex(name) orelse return;
+        const binding_idx = self.findVisibleBindingIndex(name) orelse return null;
         self.node_to_binding.putDirect(i, binding_idx);
         if (self.crossesFunctionBoundary(self.bindings.items[binding_idx].scope)) {
             self.bindings.items[binding_idx].is_captured = true;
         }
+        return binding_idx;
+    }
+
+    fn recordIdentifierOccurrence(self: *Builder, idx: NodeIndex, binding_idx: ?u32) Allocator.Error!void {
+        const i = @intFromEnum(idx);
+        if (binding_idx) |bid| {
+            self.sd_resolved_binding[i] = bid;
+            try self.sd_resolved_ids.append(self.allocator, @intCast(i));
+            return;
+        }
+        // Unresolved identifier: record occurrence directly.
+        const mt = self.ast.nodes.items(.main_token)[i];
+        const fn_boundary = self.sd_current_fn;
+        const occurrence: IdentifierOccurrence = .{
+            .node = idx,
+            .function_boundary = if (fn_boundary == .none) null else fn_boundary,
+            .start = self.ast.tokens.items(.start)[@intFromEnum(mt)],
+        };
+        const name = self.ast.tokenSlice(mt);
+        const gop = try self.sd_unresolved_occurrences.getOrPut(self.allocator, name);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(self.allocator, occurrence);
+    }
+
+    fn recordFunctionBindingNode(self: *Builder, _: NodeIndex, data: Node.Data) void {
+        const lhs = data.binary.lhs;
+        const rhs = data.binary.rhs;
+        if (lhs == .none or rhs == .none) return;
+        if (self.ast.nodes.items(.tag)[@intFromEnum(lhs)] != .identifier) return;
+        const rhs_tag = self.ast.nodes.items(.tag)[@intFromEnum(rhs)];
+        switch (rhs_tag) {
+            .arrow_function_expr, .function_expr => {},
+            else => return,
+        }
+        self.sd_fn_binding_name[@intFromEnum(rhs)] = @intFromEnum(lhs);
     }
 
     fn visitAssignment(self: *Builder, idx: NodeIndex, data: Node.Data) !void {
@@ -1250,6 +1457,9 @@ const Builder = struct {
         for (self.ast.extra_data.items[params_start..params_end]) |raw| {
             const param_idx: NodeIndex = @enumFromInt(raw);
             try self.collectBindingNames(param_idx, .param);
+            // Visit the parameter node so session data is set for it and its
+            // children (default values, destructuring patterns, etc.).
+            try self.visit(param_idx);
         }
     }
 

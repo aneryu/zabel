@@ -360,6 +360,7 @@ pub const Pipeline = struct {
             const scope_started_ns = if (record_timings) monotonicNowNs() else 0;
             scope_result = scope_mod.analyzeWithOptions(ast, self.allocator, .{
                 .extra_globals = self.scope_extra_globals,
+                .build_session_data = true,
             }) catch blk: {
                 scope_error = true;
                 break :blk null;

@@ -14,11 +14,7 @@ pub const SubtreeRange = struct {
     end: u32,
 };
 
-pub const IdentifierOccurrence = struct {
-    node: NodeIndex,
-    function_boundary: ?NodeIndex,
-    start: u32,
-};
+pub const IdentifierOccurrence = scope_mod.IdentifierOccurrence;
 
 pub const TransformSession = struct {
     ast: *const Ast,
@@ -43,9 +39,81 @@ pub const TransformSession = struct {
     // First 4 slices init to maxInt(u32), last 2 init to 0.
     const slices_with_max_init = 4;
     const total_slices = 6;
+    /// Number of slices allocated only when no pre-built data is available from scope.
+    const own_only_slices = 2; // fn_binding_name + resolved_binding
 
     pub fn init(allocator: Allocator, ast: *Ast, scope: ?*scope_mod.ScopeResult) !TransformSession {
         const node_count = ast.nodes.len;
+
+        // Check if scope analysis pre-built ALL session data.
+        const has_full_prebuilt = if (scope) |s| s.session_binding_occurrences.len > 0 else false;
+
+        if (has_full_prebuilt) {
+            // Scope built everything: flat arrays + occurrence lists.
+            // Session init is near-zero: just accept transferred ownership.
+            const s = scope.?;
+            const sd = s.session_data_block;
+            // sd layout: [parent_map | fn_boundary | fn_binding_name | resolved_binding | preorder_start | preorder_end]
+            var session = TransformSession{
+                .ast = ast,
+                .scope = scope,
+                .node_data_block = sd,
+                .parent_map = @ptrCast(sd[0..node_count]),
+                .function_boundary_for_node = @ptrCast(sd[node_count .. 2 * node_count]),
+                .function_binding_name_node = @ptrCast(sd[2 * node_count .. 3 * node_count]),
+                .resolved_binding_for_node = sd[3 * node_count .. 4 * node_count],
+                .preorder_start = sd[4 * node_count .. 5 * node_count],
+                .preorder_end = sd[5 * node_count .. 6 * node_count],
+                .function_binding_indices = &.{},
+                .binding_occurrences = s.session_binding_occurrences,
+                .unresolved_occurrences = s.session_unresolved_occurrences,
+                .this_occurrences = s.session_this_occurrences,
+            };
+            // Mark scope as consumed so it doesn't double-free.
+            s.session_data_block = &.{};
+            s.session_binding_occurrences = &.{};
+            s.session_unresolved_occurrences = .empty;
+            s.session_this_occurrences = .empty;
+
+            session.sortOccurrences();
+            return session;
+        }
+
+        // Fallback: scope pre-built flat arrays (6 slices) but no occurrence data.
+        const has_partial_prebuilt = if (scope) |s| s.session_data_block.len > 0 else false;
+
+        if (has_partial_prebuilt) {
+            const sd = scope.?.session_data_block;
+            // Transfer ownership: TransformSession will free sd via node_data_block.
+            scope.?.session_data_block = &.{};
+            // sd layout: [parent_map | fn_boundary | fn_binding_name | resolved_binding | preorder_start | preorder_end]
+            var session = TransformSession{
+                .ast = ast,
+                .scope = scope,
+                .node_data_block = sd,
+                .parent_map = @ptrCast(sd[0..node_count]),
+                .function_boundary_for_node = @ptrCast(sd[node_count .. 2 * node_count]),
+                .function_binding_name_node = @ptrCast(sd[2 * node_count .. 3 * node_count]),
+                .resolved_binding_for_node = sd[3 * node_count .. 4 * node_count],
+                .preorder_start = sd[4 * node_count .. 5 * node_count],
+                .preorder_end = sd[5 * node_count .. 6 * node_count],
+                .function_binding_indices = &.{},
+                .binding_occurrences = &.{},
+                .unresolved_occurrences = .empty,
+                .this_occurrences = .empty,
+            };
+            errdefer session.deinit(allocator);
+
+            try session.initBindingOccurrences(allocator);
+            const estimated_unresolved: u32 = @intCast(@max(node_count / 32, 16));
+            try session.unresolved_occurrences.ensureTotalCapacity(allocator, estimated_unresolved);
+
+            try session.buildOccurrencesLinear(allocator);
+            session.sortOccurrences();
+            return session;
+        }
+
+        // Fall back to full DFS when no pre-built data.
         const block = try allocator.alloc(u32, total_slices * node_count);
         errdefer allocator.free(block);
 
@@ -98,7 +166,7 @@ pub const TransformSession = struct {
             occurrences.deinit(allocator);
         }
         if (self.binding_occurrences.len > 0) allocator.free(self.binding_occurrences);
-        allocator.free(self.node_data_block);
+        if (self.node_data_block.len > 0) allocator.free(self.node_data_block);
         self.* = undefined;
     }
 
@@ -234,6 +302,25 @@ pub const TransformSession = struct {
         }
 
         self.sortOccurrences();
+    }
+
+    /// Linear scan to record identifier/this occurrences and function binding names.
+    /// Used when parent_map/fn_boundary/preorder are pre-built by scope analysis.
+    fn buildOccurrencesLinear(self: *TransformSession, allocator: Allocator) Allocator.Error!void {
+        const tags = self.ast.nodes.items(.tag);
+        const node_count = tags.len;
+        for (0..node_count) |raw| {
+            const tag = tags[raw];
+            const node: NodeIndex = @enumFromInt(raw);
+            self.recordFunctionBindingNode(node, tag);
+            if (tag == .identifier) {
+                const current_fn = self.function_boundary_for_node[raw];
+                const fn_or_null: ?NodeIndex = if (current_fn == .none) null else current_fn;
+                try self.recordIdentifierOccurrence(allocator, node, fn_or_null);
+            } else if (tag == .this_expr) {
+                try self.this_occurrences.append(allocator, node);
+            }
+        }
     }
 
     fn initBindingOccurrences(self: *TransformSession, allocator: Allocator) Allocator.Error!void {
