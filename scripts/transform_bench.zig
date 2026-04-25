@@ -140,14 +140,11 @@ fn parseSource(alloc: std.mem.Allocator, source: []const u8, language: zb.Langua
     });
 }
 
-fn parseTs(alloc: std.mem.Allocator, source: []const u8) !zb.ParseResult {
-    return parseSource(alloc, source, .typescript);
-}
-
 fn languageFromPath(path: []const u8) zb.Language {
     if (std.mem.endsWith(u8, path, ".tsx")) return .tsx;
     if (std.mem.endsWith(u8, path, ".ts")) return .typescript;
     if (std.mem.endsWith(u8, path, ".jsx")) return .jsx;
+    if (std.mem.endsWith(u8, path, ".flow.js")) return .flow;
     return .javascript;
 }
 
@@ -155,6 +152,7 @@ fn benchStage(
     allocator: std.mem.Allocator,
     io: std.Io,
     source: []const u8,
+    language: zb.Language,
     stage: usize,
     warmups: usize,
     iterations: usize,
@@ -177,7 +175,7 @@ fn benchStage(
         defer arena.deinit();
         const alloc = arena.allocator();
 
-        var result = try parseTs(alloc, source);
+        var result = try parseSource(alloc, source, language);
         var pipeline = try buildStagePipeline(alloc, stage, telemetry_session, spanPtr(&stage_span));
         defer pipeline.deinit();
 
@@ -206,6 +204,7 @@ fn benchPhase(
     allocator: std.mem.Allocator,
     io: std.Io,
     source: []const u8,
+    language: zb.Language,
     warmups: usize,
     iterations: usize,
     telemetry_session: ?*zb.Telemetry.TelemetrySession,
@@ -230,7 +229,7 @@ fn benchPhase(
         const alloc = arena.allocator();
 
         const parse_timer = startTimer(io);
-        var result = try parseTs(alloc, source);
+        var result = try parseSource(alloc, source, language);
         const parse_elapsed = readTimerNs(io, parse_timer);
 
         var pipeline = try buildFullPipeline(alloc, telemetry_session, spanPtr(&phase_span));
@@ -275,6 +274,7 @@ fn benchTotal(
     allocator: std.mem.Allocator,
     io: std.Io,
     source: []const u8,
+    language: zb.Language,
     warmups: usize,
     iterations: usize,
     telemetry_session: ?*zb.Telemetry.TelemetrySession,
@@ -296,7 +296,7 @@ fn benchTotal(
         const alloc = arena.allocator();
 
         const timer = startTimer(io);
-        var result = try parseTs(alloc, source);
+        var result = try parseSource(alloc, source, language);
         var pipeline = try buildFullPipeline(alloc, telemetry_session, spanPtr(&total_span));
         defer pipeline.deinit();
         try pipeline.run(&result.ast);
@@ -442,6 +442,7 @@ fn benchProfile(
     allocator: std.mem.Allocator,
     io: std.Io,
     source: []const u8,
+    language: zb.Language,
     warmups: usize,
     iterations: usize,
     telemetry_session: ?*zb.Telemetry.TelemetrySession,
@@ -469,7 +470,7 @@ fn benchProfile(
         defer arena.deinit();
         const alloc = arena.allocator();
 
-        var result = try parseTs(alloc, source);
+        var result = try parseSource(alloc, source, language);
         var pipeline = try buildFullPipeline(alloc, telemetry_session, spanPtr(&profile_span));
         defer pipeline.deinit();
         pipeline.collect_run_stats = true;
@@ -702,13 +703,15 @@ pub fn main(init: std.process.Init) !void {
             return error.InvalidArgs;
         }
 
-        const source = try std.Io.Dir.cwd().readFileAlloc(io, filtered.items[1], allocator, .limited(64 * 1024 * 1024));
+        const file_path = filtered.items[1];
+        const source = try std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(64 * 1024 * 1024));
         defer allocator.free(source);
+        const language = languageFromPath(file_path);
 
         const stage = try std.fmt.parseInt(usize, filtered.items[2], 10);
         const warmups = try std.fmt.parseInt(usize, filtered.items[3], 10);
         const iterations = try std.fmt.parseInt(usize, filtered.items[4], 10);
-        try benchStage(allocator, io, source, stage, warmups, iterations, if (telemetry_session) |*session| session else null, spanPtr(&run_span));
+        try benchStage(allocator, io, source, language, stage, warmups, iterations, if (telemetry_session) |*session| session else null, spanPtr(&run_span));
         if (telemetry_session) |*session| session.finishSpan(spanPtr(&run_span), .ok, &.{
             zb.Telemetry.Field.string("mode", "stage"),
         });
@@ -721,12 +724,14 @@ pub fn main(init: std.process.Init) !void {
             return error.InvalidArgs;
         }
 
-        const source = try std.Io.Dir.cwd().readFileAlloc(io, filtered.items[1], allocator, .limited(64 * 1024 * 1024));
+        const file_path = filtered.items[1];
+        const source = try std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(64 * 1024 * 1024));
         defer allocator.free(source);
+        const language = languageFromPath(file_path);
 
         const warmups = try std.fmt.parseInt(usize, filtered.items[2], 10);
         const iterations = try std.fmt.parseInt(usize, filtered.items[3], 10);
-        try benchPhase(allocator, io, source, warmups, iterations, if (telemetry_session) |*session| session else null, spanPtr(&run_span));
+        try benchPhase(allocator, io, source, language, warmups, iterations, if (telemetry_session) |*session| session else null, spanPtr(&run_span));
         if (telemetry_session) |*session| session.finishSpan(spanPtr(&run_span), .ok, &.{
             zb.Telemetry.Field.string("mode", "phase"),
         });
@@ -739,12 +744,14 @@ pub fn main(init: std.process.Init) !void {
             return error.InvalidArgs;
         }
 
-        const source = try std.Io.Dir.cwd().readFileAlloc(io, filtered.items[1], allocator, .limited(64 * 1024 * 1024));
+        const file_path = filtered.items[1];
+        const source = try std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(64 * 1024 * 1024));
         defer allocator.free(source);
+        const language = languageFromPath(file_path);
 
         const warmups = try std.fmt.parseInt(usize, filtered.items[2], 10);
         const iterations = try std.fmt.parseInt(usize, filtered.items[3], 10);
-        try benchTotal(allocator, io, source, warmups, iterations, if (telemetry_session) |*session| session else null, spanPtr(&run_span));
+        try benchTotal(allocator, io, source, language, warmups, iterations, if (telemetry_session) |*session| session else null, spanPtr(&run_span));
         if (telemetry_session) |*session| session.finishSpan(spanPtr(&run_span), .ok, &.{
             zb.Telemetry.Field.string("mode", "total"),
         });
@@ -774,12 +781,14 @@ pub fn main(init: std.process.Init) !void {
             return error.InvalidArgs;
         }
 
-        const source = try std.Io.Dir.cwd().readFileAlloc(io, filtered.items[1], allocator, .limited(64 * 1024 * 1024));
+        const file_path = filtered.items[1];
+        const source = try std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(64 * 1024 * 1024));
         defer allocator.free(source);
+        const language = languageFromPath(file_path);
 
         const warmups = try std.fmt.parseInt(usize, filtered.items[2], 10);
         const iterations = try std.fmt.parseInt(usize, filtered.items[3], 10);
-        try benchProfile(allocator, io, source, warmups, iterations, if (telemetry_session) |*session| session else null, spanPtr(&run_span));
+        try benchProfile(allocator, io, source, language, warmups, iterations, if (telemetry_session) |*session| session else null, spanPtr(&run_span));
         if (telemetry_session) |*session| session.finishSpan(spanPtr(&run_span), .ok, &.{
             zb.Telemetry.Field.string("mode", "profile"),
         });

@@ -471,15 +471,29 @@ fn renderSimpleLegacyDecoratedSurfaceClass(ctx: *TransformContext, info: *ClassI
     if (class_name.len == 0 or std.mem.eql(u8, class_name, "_Class")) return null;
 
     if (info.decorator_range) |decorators| {
-        if (info.ctor != null or info.instance_fields.items.len != 0 or info.methods.items.len != 0) return null;
+        if (info.instance_fields.items.len != 0 or info.methods.items.len != 0) return null;
         const decorator_expr = renderSingleDecoratorExpr(ctx, decorators) catch return null;
+        if (info.ctor == null) {
+            const replacement = std.fmt.allocPrint(
+                ctx.allocator,
+                "let {s} = {s}(_class = class {s} {{}}) || _class;",
+                .{ class_name, decorator_expr, class_name },
+            ) catch return null;
+            return .{
+                .prelude = "var _class;",
+                .replacement = replacement,
+            };
+        }
+        // Decorated class with constructor body — use _dec pattern
+        const body_src = getNodeSource(ctx, info.body);
+        if (body_src.len == 0) return null;
         const replacement = std.fmt.allocPrint(
             ctx.allocator,
-            "let {s} = {s}(_class = class {s} {{}}) || _class;",
-            .{ class_name, decorator_expr, class_name },
+            "let {s} = (_dec = {s}, _dec(_class = class {s} {s}) || _class);",
+            .{ class_name, decorator_expr, class_name, body_src },
         ) catch return null;
         return .{
-            .prelude = "var _class;",
+            .prelude = "var _dec, _class;",
             .replacement = replacement,
         };
     }
@@ -1107,7 +1121,13 @@ fn renderSingleDecoratorExpr(ctx: *TransformContext, range: ExtraRange) ![]const
 
     const decorator: NodeIndex = @enumFromInt(ctx.ast.extra_data.items[start]);
     if (ctx.nodeTag(decorator) == .decorator) {
-        return ctx.allocator.dupe(u8, getNodeSource(ctx, ctx.nodeData(decorator).unary));
+        // Use decorator node source minus @ prefix to handle call expressions
+        // (call_expr main token is '(' so getNodeSource on the unary misses the callee)
+        const full_src = getNodeSource(ctx, decorator);
+        if (full_src.len > 0 and full_src[0] == '@') {
+            return ctx.allocator.dupe(u8, std.mem.trimStart(u8, full_src[1..], &[_]u8{ ' ', '\t' }));
+        }
+        return ctx.allocator.dupe(u8, full_src);
     }
     return ctx.allocator.dupe(u8, getNodeSource(ctx, decorator));
 }
