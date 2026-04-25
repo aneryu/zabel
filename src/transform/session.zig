@@ -57,7 +57,7 @@ pub const TransformSession = struct {
             var session = TransformSession{
                 .ast = ast,
                 .scope = scope,
-                .node_data_block = &.{},
+                .node_data_block = sd,
                 .parent_map = @ptrCast(sd[0..node_count]),
                 .function_boundary_for_node = @ptrCast(sd[node_count .. 2 * node_count]),
                 .function_binding_name_node = @ptrCast(sd[2 * node_count .. 3 * node_count]),
@@ -70,6 +70,7 @@ pub const TransformSession = struct {
                 .this_occurrences = s.session_this_occurrences,
             };
             // Mark scope as consumed so it doesn't double-free.
+            s.session_data_block = &.{};
             s.session_binding_occurrences = &.{};
             s.session_unresolved_occurrences = .empty;
             s.session_this_occurrences = .empty;
@@ -83,11 +84,13 @@ pub const TransformSession = struct {
 
         if (has_partial_prebuilt) {
             const sd = scope.?.session_data_block;
+            // Transfer ownership: TransformSession will free sd via node_data_block.
+            scope.?.session_data_block = &.{};
             // sd layout: [parent_map | fn_boundary | fn_binding_name | resolved_binding | preorder_start | preorder_end]
             var session = TransformSession{
                 .ast = ast,
                 .scope = scope,
-                .node_data_block = &.{},
+                .node_data_block = sd,
                 .parent_map = @ptrCast(sd[0..node_count]),
                 .function_boundary_for_node = @ptrCast(sd[node_count .. 2 * node_count]),
                 .function_binding_name_node = @ptrCast(sd[2 * node_count .. 3 * node_count]),
