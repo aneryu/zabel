@@ -5203,7 +5203,11 @@ pub const Codegen = struct {
             } else false;
 
             if (decs_before_export) {
-                try self.emitDecorators(decl_node);
+                // Skip decorator emission when the class has been replaced by
+                // a transform (e.g. legacy decorator lowering) — the replacement
+                // text already encodes the decorator semantics.
+                const decl_replaced = self.ast.replacement_source.contains(@intFromEnum(decl_node));
+                if (!decl_replaced) try self.emitDecorators(decl_node);
                 try self.writeStr("export ");
                 self.suppress_decorators = true;
                 try self.emitNode(decl_node);

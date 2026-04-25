@@ -2195,7 +2195,8 @@ fn collectLocalPluginAddGlobals(
             plugin_name
         else
             try std.fs.path.join(scratch_alloc, &.{ fixture_dir, plugin_name });
-        const plugin_source = std.Io.Dir.cwd().readFileAlloc(g_io orelse unreachable, plugin_path, scratch_alloc, .limited(32 * 1024)) catch continue;
+        const plugin_source = std.Io.Dir.cwd().readFileAlloc(g_io orelse unreachable, plugin_path, scratch_alloc, .limited(32 * 1024)) catch
+            std.Io.Dir.cwd().readFileAlloc(g_io orelse unreachable, try std.fmt.allocPrint(scratch_alloc, "{s}.js", .{plugin_path}), scratch_alloc, .limited(32 * 1024)) catch continue;
         try appendAddGlobalNamesFromPluginSource(caller_alloc, plugin_source, result);
         appendLocalPluginEffectsFromPluginSource(plugin_source, result);
     }
