@@ -31,6 +31,7 @@ pub const TransformSession = struct {
     function_binding_name_node: []NodeIndex,
     resolved_binding_for_node: []u32,
     function_binding_indices: []FunctionBindingIndexMap,
+    function_binding_indices_built: bool = false,
     binding_occurrences: []std.ArrayListUnmanaged(IdentifierOccurrence),
     /// Occurrences for identifiers that did not resolve to any binding
     /// (globals, free references, or when scope analysis is absent).
@@ -75,7 +76,6 @@ pub const TransformSession = struct {
         try session.unresolved_occurrences.ensureTotalCapacity(allocator, estimated_unresolved);
 
         try session.buildParentAndRanges(allocator);
-        try session.buildFunctionBindingIndices(allocator);
         return session;
     }
 
@@ -179,11 +179,36 @@ pub const TransformSession = struct {
         return binding_node;
     }
 
-    pub fn functionBindingIndices(self: *const TransformSession, owner_scope_idx: scope_mod.ScopeIndex, name: []const u8) ?[]const u32 {
+    pub fn functionBindingIndices(self: *TransformSession, owner_scope_idx: scope_mod.ScopeIndex, name: []const u8) ?[]const u32 {
+        if (!self.function_binding_indices_built) {
+            self.ensureFunctionBindingIndices() catch return null;
+        }
         const owner_scope_i = @intFromEnum(owner_scope_idx);
         if (owner_scope_i >= self.function_binding_indices.len) return null;
         const indices = self.function_binding_indices[owner_scope_i].get(name) orelse return null;
         return indices.items;
+    }
+
+    fn ensureFunctionBindingIndices(self: *TransformSession) Allocator.Error!void {
+        if (self.function_binding_indices_built) return;
+        const scope = self.scope orelse return;
+        const allocator = scope.allocator;
+        self.function_binding_indices = try allocator.alloc(FunctionBindingIndexMap, scope.scopes.len);
+        for (self.function_binding_indices) |*map| map.* = .{};
+
+        for (scope.bindings, 0..) |binding, binding_idx| {
+            const owner_scope_idx = scope.containingFunctionScope(binding.scope);
+            const owner_scope_i = @intFromEnum(owner_scope_idx);
+            if (owner_scope_i >= self.function_binding_indices.len) continue;
+
+            const map = &self.function_binding_indices[owner_scope_i];
+            const gop = try map.getOrPut(allocator, binding.name);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .empty;
+            }
+            try gop.value_ptr.append(allocator, @intCast(binding_idx));
+        }
+        self.function_binding_indices_built = true;
     }
 
     fn buildParentAndRanges(self: *TransformSession, allocator: Allocator) Allocator.Error!void {
@@ -206,25 +231,6 @@ pub const TransformSession = struct {
         const scope = self.scope orelse return;
         self.binding_occurrences = try allocator.alloc(std.ArrayListUnmanaged(IdentifierOccurrence), scope.bindings.len);
         for (self.binding_occurrences) |*occurrences| occurrences.* = .empty;
-    }
-
-    fn buildFunctionBindingIndices(self: *TransformSession, allocator: Allocator) Allocator.Error!void {
-        const scope = self.scope orelse return;
-        self.function_binding_indices = try allocator.alloc(FunctionBindingIndexMap, scope.scopes.len);
-        for (self.function_binding_indices) |*map| map.* = .{};
-
-        for (scope.bindings, 0..) |binding, binding_idx| {
-            const owner_scope_idx = scope.containingFunctionScope(binding.scope);
-            const owner_scope_i = @intFromEnum(owner_scope_idx);
-            if (owner_scope_i >= self.function_binding_indices.len) continue;
-
-            const map = &self.function_binding_indices[owner_scope_i];
-            const gop = try map.getOrPut(allocator, binding.name);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = .empty;
-            }
-            try gop.value_ptr.append(allocator, @intCast(binding_idx));
-        }
     }
 
     fn visitNode(

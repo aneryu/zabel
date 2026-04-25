@@ -24,6 +24,7 @@ fn readTimerNs(io: std.Io, started: std.Io.Timestamp) u64 {
 fn buildStagePipeline(
     alloc: std.mem.Allocator,
     stage: usize,
+    language: zb.Language,
     telemetry_session: ?*zb.Telemetry.TelemetrySession,
     telemetry_parent_span: ?*const zb.Telemetry.SpanHandle,
 ) !zb.Pipeline {
@@ -33,7 +34,7 @@ fn buildStagePipeline(
     var idx: usize = 0;
 
     idx += 1;
-    if (stage >= idx) try pipeline.addPass(zb.TsStrip.createPass(.{}));
+    if (stage >= idx) try pipeline.addPass(zb.TsStrip.createPass(.{ .language = language }));
 
     pipeline.needs_scope = stage >= 5;
 
@@ -88,6 +89,7 @@ fn buildStagePipeline(
 
 fn buildFullPipeline(
     alloc: std.mem.Allocator,
+    language: zb.Language,
     telemetry_session: ?*zb.Telemetry.TelemetrySession,
     telemetry_parent_span: ?*const zb.Telemetry.SpanHandle,
 ) !zb.Pipeline {
@@ -96,7 +98,7 @@ fn buildFullPipeline(
     if (telemetry_parent_span) |span| pipeline.telemetry_parent_span = span.*;
     const config = zb.TransformConfig{ .target = .es2015, .ts_strip = true };
 
-    if (config.ts_strip) try pipeline.addPass(zb.TsStrip.createPass(.{}));
+    if (config.ts_strip) try pipeline.addPass(zb.TsStrip.createPass(.{ .language = language }));
     pipeline.needs_scope = true;
 
     if (config.needsTransform(.shorthand_properties)) try pipeline.addPass(zb.ShorthandProperties.createPass());
@@ -176,7 +178,7 @@ fn benchStage(
         const alloc = arena.allocator();
 
         var result = try parseSource(alloc, source, language);
-        var pipeline = try buildStagePipeline(alloc, stage, telemetry_session, spanPtr(&stage_span));
+        var pipeline = try buildStagePipeline(alloc, stage, language, telemetry_session, spanPtr(&stage_span));
         defer pipeline.deinit();
 
         const timer = startTimer(io);
@@ -232,7 +234,7 @@ fn benchPhase(
         var result = try parseSource(alloc, source, language);
         const parse_elapsed = readTimerNs(io, parse_timer);
 
-        var pipeline = try buildFullPipeline(alloc, telemetry_session, spanPtr(&phase_span));
+        var pipeline = try buildFullPipeline(alloc, language, telemetry_session, spanPtr(&phase_span));
         defer pipeline.deinit();
 
         const pipeline_timer = startTimer(io);
@@ -297,7 +299,7 @@ fn benchTotal(
 
         const timer = startTimer(io);
         var result = try parseSource(alloc, source, language);
-        var pipeline = try buildFullPipeline(alloc, telemetry_session, spanPtr(&total_span));
+        var pipeline = try buildFullPipeline(alloc, language, telemetry_session, spanPtr(&total_span));
         defer pipeline.deinit();
         try pipeline.run(&result.ast);
         const gen = try zb.Codegen.generate(&result.ast, .{ .comments = false }, alloc);
@@ -395,7 +397,7 @@ fn benchFiles(
             var result = try parseSource(alloc, source, lang);
             total_row.parse_ns +%= readTimerNs(io, parse_timer);
 
-            var pipeline = try buildFullPipeline(alloc, telemetry_session, spanPtr(&files_span));
+            var pipeline = try buildFullPipeline(alloc, lang, telemetry_session, spanPtr(&files_span));
             defer pipeline.deinit();
 
             const pipeline_timer = startTimer(io);
@@ -471,7 +473,7 @@ fn benchProfile(
         const alloc = arena.allocator();
 
         var result = try parseSource(alloc, source, language);
-        var pipeline = try buildFullPipeline(alloc, telemetry_session, spanPtr(&profile_span));
+        var pipeline = try buildFullPipeline(alloc, language, telemetry_session, spanPtr(&profile_span));
         defer pipeline.deinit();
         pipeline.collect_run_stats = true;
         pipeline.retain_transform_session = true;
@@ -565,7 +567,7 @@ fn benchProfileFile(
         const alloc = arena.allocator();
 
         var result = try parseSource(alloc, source, lang);
-        var pipeline = try buildFullPipeline(alloc, telemetry_session, spanPtr(&profile_span));
+        var pipeline = try buildFullPipeline(alloc, lang, telemetry_session, spanPtr(&profile_span));
         defer pipeline.deinit();
         pipeline.collect_run_stats = true;
         pipeline.retain_transform_session = true;

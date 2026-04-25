@@ -420,7 +420,7 @@ fn runTransform(io: std.Io, allocator: std.mem.Allocator, environ: std.process.E
     };
 
     if (transform_config.ts_strip) {
-        try pipeline.addPass(zig_babal.TsStrip.createPass(.{}));
+        try pipeline.addPass(zig_babal.TsStrip.createPass(.{ .language = language }));
     }
     if (language == .tsx or language == .jsx) {
         try pipeline.addPass(zig_babal.JsxTransform.createPass(.{ .runtime = jsx_runtime }));
