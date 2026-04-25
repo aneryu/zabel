@@ -15,6 +15,9 @@ const scope_mod = @import("../scope.zig");
 pub const TsStripConfig = struct {
     only_remove_type_imports: bool = false,
     optimize_const_enums: bool = false,
+    /// When set, narrow the enter filter for non-TS languages so that
+    /// only `.program` is dispatched (all other tags are no-ops for JS/Flow).
+    language: ?@import("../ast.zig").Language = null,
 };
 
 var g_config: TsStripConfig = .{};
@@ -22,90 +25,93 @@ var g_config: TsStripConfig = .{};
 pub fn createPass(config: TsStripConfig) Pass {
     g_config = config;
 
+    // For non-TS languages, only .program needs enter dispatch;
+    // all other tags would hit the early-return at the top of enterNode.
+    const is_ts = if (config.language) |lang| lang.isTypeScript() else true;
+
     var filter = visitor.NodeTagBitSet.initEmpty();
 
     // Pre-scan: handle program node to trigger import usage analysis
     filter.set(@intFromEnum(Node.Tag.program));
 
-    // A) Remove entire node — pure type declarations
-    filter.set(@intFromEnum(Node.Tag.ts_type_alias_declaration));
-    filter.set(@intFromEnum(Node.Tag.ts_interface_declaration));
-    filter.set(@intFromEnum(Node.Tag.ts_declare_function));
-    filter.set(@intFromEnum(Node.Tag.ts_declare_variable));
-    filter.set(@intFromEnum(Node.Tag.ts_declare_method));
+    if (is_ts) {
+        // A) Remove entire node — pure type declarations
+        filter.set(@intFromEnum(Node.Tag.ts_type_alias_declaration));
+        filter.set(@intFromEnum(Node.Tag.ts_interface_declaration));
+        filter.set(@intFromEnum(Node.Tag.ts_declare_function));
+        filter.set(@intFromEnum(Node.Tag.ts_declare_variable));
+        filter.set(@intFromEnum(Node.Tag.ts_declare_method));
 
-    // B) Replace with inner expression — type casts/wrappers
-    filter.set(@intFromEnum(Node.Tag.ts_as_expression));
-    filter.set(@intFromEnum(Node.Tag.ts_satisfies_expression));
-    filter.set(@intFromEnum(Node.Tag.ts_non_null_expression));
-    filter.set(@intFromEnum(Node.Tag.ts_type_assertion));
-    filter.set(@intFromEnum(Node.Tag.ts_instantiation_expression));
-    filter.set(@intFromEnum(Node.Tag.ts_type_cast_expression));
+        // B) Replace with inner expression — type casts/wrappers
+        filter.set(@intFromEnum(Node.Tag.ts_as_expression));
+        filter.set(@intFromEnum(Node.Tag.ts_satisfies_expression));
+        filter.set(@intFromEnum(Node.Tag.ts_non_null_expression));
+        filter.set(@intFromEnum(Node.Tag.ts_type_assertion));
+        filter.set(@intFromEnum(Node.Tag.ts_instantiation_expression));
+        filter.set(@intFromEnum(Node.Tag.ts_type_cast_expression));
 
-    // C) Remove type annotations and type parameter declarations
-    filter.set(@intFromEnum(Node.Tag.ts_type_annotation));
-    filter.set(@intFromEnum(Node.Tag.ts_type_parameter_declaration));
-    filter.set(@intFromEnum(Node.Tag.ts_type_parameter_instantiation));
+        // C) Remove type annotations and type parameter declarations
+        filter.set(@intFromEnum(Node.Tag.ts_type_annotation));
+        filter.set(@intFromEnum(Node.Tag.ts_type_parameter_declaration));
+        filter.set(@intFromEnum(Node.Tag.ts_type_parameter_instantiation));
 
-    // D) Import/export type handling
-    filter.set(@intFromEnum(Node.Tag.import_declaration_type));
-    filter.set(@intFromEnum(Node.Tag.export_named_type));
+        // D) Import/export type handling
+        filter.set(@intFromEnum(Node.Tag.import_declaration_type));
+        filter.set(@intFromEnum(Node.Tag.export_named_type));
 
-    // E) Module declarations (declare namespace/module)
-    filter.set(@intFromEnum(Node.Tag.ts_module_declaration));
+        // E) Module declarations (declare namespace/module)
+        filter.set(@intFromEnum(Node.Tag.ts_module_declaration));
 
-    // F) Export handling — check if declaration is a TS type construct
-    filter.set(@intFromEnum(Node.Tag.export_named));
-    filter.set(@intFromEnum(Node.Tag.export_default));
+        // F) Export handling — check if declaration is a TS type construct
+        filter.set(@intFromEnum(Node.Tag.export_named));
+        filter.set(@intFromEnum(Node.Tag.export_default));
 
-    // G) Import handling — strip type specifiers from regular imports
-    filter.set(@intFromEnum(Node.Tag.import_declaration));
+        // G) Import handling — strip type specifiers from regular imports
+        filter.set(@intFromEnum(Node.Tag.import_declaration));
 
-    // H) Side table cleanup for functions, classes, etc.
-    //    (identifier, rest_element, assignment_pattern, object_pattern,
-    //     array_pattern, declarator are handled via bulk side-table clear
-    //     in the .program enter handler below.)
-    filter.set(@intFromEnum(Node.Tag.function_declaration));
-    filter.set(@intFromEnum(Node.Tag.async_function_declaration));
-    filter.set(@intFromEnum(Node.Tag.generator_declaration));
-    filter.set(@intFromEnum(Node.Tag.async_generator_declaration));
-    filter.set(@intFromEnum(Node.Tag.function_expr));
-    filter.set(@intFromEnum(Node.Tag.arrow_function_expr));
-    filter.set(@intFromEnum(Node.Tag.class_declaration));
-    filter.set(@intFromEnum(Node.Tag.class_expr));
-    filter.set(@intFromEnum(Node.Tag.class_method));
-    filter.set(@intFromEnum(Node.Tag.class_private_method));
-    filter.set(@intFromEnum(Node.Tag.class_field));
-    filter.set(@intFromEnum(Node.Tag.class_private_field));
-    filter.set(@intFromEnum(Node.Tag.method_definition));
-    filter.set(@intFromEnum(Node.Tag.getter));
-    filter.set(@intFromEnum(Node.Tag.setter));
-    filter.set(@intFromEnum(Node.Tag.computed_method));
-    filter.set(@intFromEnum(Node.Tag.declarator));
+        // H) Side table cleanup for functions, classes, etc.
+        filter.set(@intFromEnum(Node.Tag.function_declaration));
+        filter.set(@intFromEnum(Node.Tag.async_function_declaration));
+        filter.set(@intFromEnum(Node.Tag.generator_declaration));
+        filter.set(@intFromEnum(Node.Tag.async_generator_declaration));
+        filter.set(@intFromEnum(Node.Tag.function_expr));
+        filter.set(@intFromEnum(Node.Tag.arrow_function_expr));
+        filter.set(@intFromEnum(Node.Tag.class_declaration));
+        filter.set(@intFromEnum(Node.Tag.class_expr));
+        filter.set(@intFromEnum(Node.Tag.class_method));
+        filter.set(@intFromEnum(Node.Tag.class_private_method));
+        filter.set(@intFromEnum(Node.Tag.class_field));
+        filter.set(@intFromEnum(Node.Tag.class_private_field));
+        filter.set(@intFromEnum(Node.Tag.method_definition));
+        filter.set(@intFromEnum(Node.Tag.getter));
+        filter.set(@intFromEnum(Node.Tag.setter));
+        filter.set(@intFromEnum(Node.Tag.computed_method));
+        filter.set(@intFromEnum(Node.Tag.declarator));
 
-    // I) TS parameter property — replace with inner parameter
-    filter.set(@intFromEnum(Node.Tag.ts_parameter_property));
+        // I) TS parameter property — replace with inner parameter
+        filter.set(@intFromEnum(Node.Tag.ts_parameter_property));
 
-    // J) TS enum declaration (for declare enum removal)
-    filter.set(@intFromEnum(Node.Tag.ts_enum_declaration));
-    filter.set(@intFromEnum(Node.Tag.member_expr));
-    filter.set(@intFromEnum(Node.Tag.computed_member_expr));
+        // J) TS enum declaration (for declare enum removal)
+        filter.set(@intFromEnum(Node.Tag.ts_enum_declaration));
+        filter.set(@intFromEnum(Node.Tag.member_expr));
+        filter.set(@intFromEnum(Node.Tag.computed_member_expr));
 
-    // N) export_all — handle `export type * from` removal
-    filter.set(@intFromEnum(Node.Tag.export_all));
+        // N) export_all — handle `export type * from` removal
+        filter.set(@intFromEnum(Node.Tag.export_all));
 
-    // L) TS index signature (in class bodies — remove)
-    filter.set(@intFromEnum(Node.Tag.ts_index_signature));
+        // L) TS index signature (in class bodies — remove)
+        filter.set(@intFromEnum(Node.Tag.ts_index_signature));
 
-    // K) TS import equals, export assignment, namespace export
-    filter.set(@intFromEnum(Node.Tag.ts_import_equals_declaration));
-    filter.set(@intFromEnum(Node.Tag.ts_export_assignment));
-    filter.set(@intFromEnum(Node.Tag.ts_namespace_export_declaration));
+        // K) TS import equals, export assignment, namespace export
+        filter.set(@intFromEnum(Node.Tag.ts_import_equals_declaration));
+        filter.set(@intFromEnum(Node.Tag.ts_export_assignment));
+        filter.set(@intFromEnum(Node.Tag.ts_namespace_export_declaration));
+    }
 
     // Exit filter — exitNode only handles .program and .ts_module_declaration.
     var ef = visitor.NodeTagBitSet.initEmpty();
     ef.set(@intFromEnum(Node.Tag.program));
-    ef.set(@intFromEnum(Node.Tag.ts_module_declaration));
+    if (is_ts) ef.set(@intFromEnum(Node.Tag.ts_module_declaration));
 
     return .{
         .name = "ts_strip",
