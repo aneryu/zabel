@@ -28,11 +28,12 @@ pub var g_body_temps: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged([]con
 
 pub fn createPass(config: Config) Pass {
     g_config = config;
-    var filter = visitor.NodeTagBitSet.initEmpty();
-    filter.set(@intFromEnum(Node.Tag.assignment_expr));
+    var exit_filter = visitor.NodeTagBitSet.initEmpty();
+    exit_filter.set(@intFromEnum(Node.Tag.assignment_expr));
     return .{
         .name = "logical_assignment",
-        .node_filter = filter,
+        .node_filter = visitor.NodeTagBitSet.initEmpty(),
+        .exit_filter = exit_filter,
         .exit = exitNode,
         .priority = 25, // Run before nullish-coalescing (30) so the ??= → ?? chain works
     };

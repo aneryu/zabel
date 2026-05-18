@@ -39,30 +39,25 @@ const LoopHoistNames = struct {
     len: u8 = 0,
 };
 var g_loop_hoisted_head_vars: std.AutoHashMapUnmanaged(u32, LoopHoistNames) = .empty;
-const FunctionBindingQueryCache = std.StringHashMapUnmanaged(u8);
-var g_outer_binding_query_cache: []FunctionBindingQueryCache = &[_]FunctionBindingQueryCache{};
-var g_function_scope_binding_query_cache: []FunctionBindingQueryCache = &[_]FunctionBindingQueryCache{};
-var g_function_binding_query_cache_ready: bool = false;
+
 /// Parent pointers for the current AST, used for loop-wrapper and TDZ checks.
-var g_node_parents: []u32 = &[_]u32{};
-var g_node_parents_ready: bool = false;
 var g_parent_session: ?*const session_mod.TransformSession = null;
-const parent_none = std.math.maxInt(u32);
 
 pub fn createPass(config: Config) Pass {
     g_config = config;
-    var filter = visitor.NodeTagBitSet.initEmpty();
-    filter.set(@intFromEnum(Node.Tag.let_declaration));
-    filter.set(@intFromEnum(Node.Tag.const_declaration));
-    filter.set(@intFromEnum(Node.Tag.class_declaration));
-    filter.set(@intFromEnum(Node.Tag.for_statement));
-    filter.set(@intFromEnum(Node.Tag.for_in_statement));
-    filter.set(@intFromEnum(Node.Tag.for_of_statement));
-    filter.set(@intFromEnum(Node.Tag.while_statement));
-    filter.set(@intFromEnum(Node.Tag.do_while_statement));
+    var exit_filter = visitor.NodeTagBitSet.initEmpty();
+    exit_filter.set(@intFromEnum(Node.Tag.let_declaration));
+    exit_filter.set(@intFromEnum(Node.Tag.const_declaration));
+    exit_filter.set(@intFromEnum(Node.Tag.class_declaration));
+    exit_filter.set(@intFromEnum(Node.Tag.for_statement));
+    exit_filter.set(@intFromEnum(Node.Tag.for_in_statement));
+    exit_filter.set(@intFromEnum(Node.Tag.for_of_statement));
+    exit_filter.set(@intFromEnum(Node.Tag.while_statement));
+    exit_filter.set(@intFromEnum(Node.Tag.do_while_statement));
     return .{
         .name = "block_scoping",
-        .node_filter = filter,
+        .node_filter = visitor.NodeTagBitSet.initEmpty(), // no enter work
+        .exit_filter = exit_filter,
         .exit = exitNode,
         .priority = 30, // Run after arrow-functions (20) and block-scoped-functions (25)
     };
@@ -74,15 +69,16 @@ pub fn resetState() void {
     g_loop_this_counter = 0;
     g_loop_body_this_names = .{};
     g_loop_hoisted_head_vars = .{};
-    g_outer_binding_query_cache = &[_]FunctionBindingQueryCache{};
-    g_function_scope_binding_query_cache = &[_]FunctionBindingQueryCache{};
-    g_function_binding_query_cache_ready = false;
-    g_node_parents = &[_]u32{};
-    g_node_parents_ready = false;
     g_parent_session = null;
 }
 
 fn exitNode(idx: NodeIndex, ctx: *TransformContext) visitor.VisitResult {
+    // Ensure the parent session is set as early as possible. Block scoping now always
+    // runs with a rich TransformSession (set in pipeline when needs_scope is true).
+    if (g_parent_session == null) {
+        if (ctx.session) |s| g_parent_session = s;
+    }
+
     const tag = ctx.nodeTag(idx);
     switch (tag) {
         .let_declaration => handleLetOrConst(idx, ctx, false),
@@ -246,26 +242,19 @@ fn getSiblingBindingInfo(
 
 fn hasOuterBinding(ctx: *TransformContext, result: *const scope_mod.ScopeResult, func_scope_idx: ?scope_mod.ScopeIndex, name: []const u8) bool {
     const fs_idx = func_scope_idx orelse return false;
-    ensureFunctionBindingQueryCaches(ctx);
-    const fs_i = @intFromEnum(fs_idx);
-    if (fs_i < g_outer_binding_query_cache.len) {
-        if (g_outer_binding_query_cache[fs_i].get(name)) |cached| return cached != 0;
-    }
 
     const binding_indices = bindingIndicesForName(ctx, name) orelse return false;
-    const fs = result.scopes[fs_i];
+    const fs = result.scopes[@intFromEnum(fs_idx)];
     var ancestor = fs.parent;
     while (ancestor) |anc_idx| {
         for (binding_indices) |binding_idx_raw| {
             const b = result.bindings[binding_idx_raw];
             if (b.scope == anc_idx) {
-                cacheFunctionBindingQuery(ctx, &g_outer_binding_query_cache, fs_i, name, true);
                 return true;
             }
         }
         ancestor = result.scopes[@intFromEnum(anc_idx)].parent;
     }
-    cacheFunctionBindingQuery(ctx, &g_outer_binding_query_cache, fs_i, name, false);
     return false;
 }
 
@@ -278,16 +267,8 @@ fn hasFunctionScopeBinding(
 ) bool {
     const fs_idx = func_scope_idx orelse return false;
     if (fs_idx == current_scope_idx) return false;
-    ensureFunctionBindingQueryCaches(ctx);
-    const fs_i = @intFromEnum(fs_idx);
-    if (fs_i < g_function_scope_binding_query_cache.len) {
-        if (g_function_scope_binding_query_cache[fs_i].get(name)) |cached| return cached != 0;
-    }
 
-    const binding_indices = bindingIndicesForName(ctx, name) orelse {
-        cacheFunctionBindingQuery(ctx, &g_function_scope_binding_query_cache, fs_i, name, false);
-        return false;
-    };
+    const binding_indices = bindingIndicesForName(ctx, name) orelse return false;
     for (binding_indices) |binding_idx_raw| {
         const b = result.bindings[binding_idx_raw];
         if (result.containingFunctionScope(b.scope) != fs_idx) continue;
@@ -295,10 +276,8 @@ fn hasFunctionScopeBinding(
         if (b.kind == .param and b.is_rest_param and !restParamHasReferencesInFunctionBody(ctx, result, fs_idx, binding_idx_raw)) {
             continue;
         }
-        cacheFunctionBindingQuery(ctx, &g_function_scope_binding_query_cache, fs_i, name, true);
         return true;
     }
-    cacheFunctionBindingQuery(ctx, &g_function_scope_binding_query_cache, fs_i, name, false);
     return false;
 }
 
@@ -1055,8 +1034,6 @@ const TdzAccessKind = enum {
 };
 
 fn handleLoopNode(idx: NodeIndex, ctx: *TransformContext) void {
-    ensureParentMap(ctx);
-
     var info = collectLoopWrapInfo(idx, ctx) orelse return;
     if (!info.needs_wrap and loopHasBlockScopedFunctionDeclarations(info.body, ctx)) {
         info.needs_wrap = true;
@@ -1064,43 +1041,6 @@ fn handleLoopNode(idx: NodeIndex, ctx: *TransformContext) void {
     if (!info.needs_wrap) return;
 
     wrapLoopNode(idx, ctx, info);
-}
-
-fn ensureParentMap(ctx: *TransformContext) void {
-    if (ctx.session) |session| {
-        g_parent_session = session;
-        return;
-    }
-    if (g_node_parents_ready) return;
-
-    const node_count = ctx.ast.nodes.items(.tag).len;
-    g_node_parents = ctx.allocator.alloc(u32, node_count) catch return;
-    @memset(g_node_parents, parent_none);
-
-    buildParentMap(ctx, @enumFromInt(0), .none);
-    g_node_parents_ready = true;
-}
-
-fn buildParentMap(ctx: *TransformContext, node: NodeIndex, parent: ?NodeIndex) void {
-    if (node == .none) return;
-    const ni = @intFromEnum(node);
-    if (ni >= g_node_parents.len) return;
-    g_node_parents[ni] = if (parent) |p| @intFromEnum(p) else parent_none;
-
-    const children = visitor.getChildren(ctx.ast, node);
-    for (children.items[0..children.len]) |child| {
-        buildParentMap(ctx, child, node);
-    }
-    if (children.range_start < children.range_end) {
-        for (ctx.ast.extra_data.items[children.range_start..children.range_end]) |raw| {
-            buildParentMap(ctx, @enumFromInt(raw), node);
-        }
-    }
-    if (children.range2_start < children.range2_end) {
-        for (ctx.ast.extra_data.items[children.range2_start..children.range2_end]) |raw| {
-            buildParentMap(ctx, @enumFromInt(raw), node);
-        }
-    }
 }
 
 fn applyLoopBodyUndefinedInit(idx: NodeIndex, ctx: *TransformContext, is_const: bool) void {
@@ -1135,8 +1075,28 @@ fn declarationHasInitializer(idx: NodeIndex, ctx: *TransformContext) bool {
 }
 
 fn isDeclarationInLoopBody(idx: NodeIndex, ctx: *TransformContext) bool {
-    ensureParentMap(ctx);
+    if (g_parent_session) |session| {
+        if (session.captureBoundaryOf(idx)) |boundary| {
+            // Only walk up to the capture boundary (function or class).
+            // This bounds the search and directly uses the precomputed structural data.
+            var current = getParentNode(idx);
+            while (current) |cur| {
+                if (cur == boundary) break; // reached the boundary without hitting a loop
+                const tag = ctx.nodeTag(cur);
+                if (isLoopNode(tag)) {
+                    const body = loopBodyNode(cur, ctx) orelse break;
+                    if (!isDescendantOf(idx, body)) break;
+                    const head = loopHeadNode(cur, ctx);
+                    if (head != null and isDescendantOf(idx, head.?)) break;
+                    return true;
+                }
+                current = getParentNode(cur);
+            }
+            return false;
+        }
+    }
 
+    // Fallback: full walk (when no session or no capture boundary found)
     var current = getParentNode(idx);
     while (current) |cur| {
         const tag = ctx.nodeTag(cur);
@@ -1172,18 +1132,26 @@ fn isDeclarationInLoopBody(idx: NodeIndex, ctx: *TransformContext) bool {
 
 fn getParentNode(node: NodeIndex) ?NodeIndex {
     if (g_parent_session) |session| {
-        if (session.parentOf(node)) |parent| return parent;
+        return session.parentOf(node);
     }
-    if (!g_node_parents_ready) return null;
-    const ni = @intFromEnum(node);
-    if (ni >= g_node_parents.len) return null;
-    const parent_raw = g_node_parents[ni];
-    if (parent_raw == parent_none) return null;
-    return @enumFromInt(parent_raw);
+    return null;
+}
+
+/// Returns true if the given node is inside a function or class (i.e., has a capture boundary).
+/// This is a small helper to make future migration of parent-walking logic cleaner.
+fn hasCaptureBoundary(node: NodeIndex) bool {
+    if (g_parent_session) |session| {
+        return session.captureBoundaryOf(node) != null;
+    }
+    return false;
 }
 
 fn isDescendantOf(node: NodeIndex, ancestor: NodeIndex) bool {
     if (node == .none or ancestor == .none) return false;
+    if (g_parent_session) |session| {
+        return session.contains(ancestor, node);
+    }
+    // Fallback (rare now that session is always provided when needs_scope is true)
     var current: ?NodeIndex = node;
     while (current) |cur| {
         if (cur == ancestor) return true;
@@ -2149,6 +2117,19 @@ fn wrapLoopNode(idx: NodeIndex, ctx: *TransformContext, info: LoopWrapInfo) void
 }
 
 fn getEnclosingLoopWrapperKind(loop_node: NodeIndex, ctx: *TransformContext) LoopWrapperKind {
+    if (g_parent_session) |session| {
+        if (session.functionBoundaryOf(loop_node)) |boundary| {
+            return switch (ctx.nodeTag(boundary)) {
+                .async_generator_declaration => .async_generator_fn,
+                .generator_declaration => .generator_fn,
+                .async_function_declaration => .async_fn,
+                else => .plain,
+            };
+        }
+        return .plain;
+    }
+
+    // Fallback: original slow parent walk
     var current = getParentNode(loop_node);
     while (current) |node| {
         switch (ctx.nodeTag(node)) {
@@ -2401,6 +2382,21 @@ fn loopHeadRebindsEachIteration(loop_node: NodeIndex, ctx: *TransformContext) bo
 }
 
 fn getLoopReplacementTarget(loop_node: NodeIndex, ctx: *TransformContext) NodeIndex {
+    if (g_parent_session) |session| {
+        if (session.captureBoundaryOf(loop_node)) |boundary| {
+            // Only walk up to the capture boundary.
+            var target = loop_node;
+            while (getParentNode(target)) |parent| {
+                if (parent == boundary) break;
+                if (ctx.nodeTag(parent) != .labeled_statement) break;
+                if (ctx.nodeData(parent).unary != target) break;
+                target = parent;
+            }
+            return target;
+        }
+    }
+
+    // Fallback: original walk
     var target = loop_node;
     while (getParentNode(target)) |parent| {
         if (ctx.nodeTag(parent) != .labeled_statement) break;
@@ -2431,6 +2427,24 @@ fn getLoopReplacementPrefix(
 }
 
 fn replacementNeedsStatementBlockWrapper(target_node: NodeIndex, ctx: *TransformContext) bool {
+    if (g_parent_session) |session| {
+        if (session.parentOf(target_node)) |parent| {
+            return switch (ctx.nodeTag(parent)) {
+                .if_statement,
+                .for_statement,
+                .for_in_statement,
+                .for_of_statement,
+                .for_of_await_statement,
+                .while_statement,
+                .do_while_statement,
+                => childListContainsNode(visitor.getChildren(ctx.ast, parent), target_node, ctx),
+                else => false,
+            };
+        }
+        return false;
+    }
+
+    // Fallback (rare now)
     const parent = getParentNode(target_node) orelse return false;
     return switch (ctx.nodeTag(parent)) {
         .if_statement,
@@ -2550,6 +2564,16 @@ fn isLoopThisBoundaryTag(tag: Node.Tag) bool {
 }
 
 fn findEnclosingFunctionBodyNode(node: NodeIndex, ctx: *TransformContext) NodeIndex {
+    if (g_parent_session) |session| {
+        // Fast path: get the nearest function-like ancestor directly
+        if (session.functionBoundaryOf(node)) |fbound| {
+            if (functionBodyNode(fbound, ctx)) |body| {
+                return body;
+            }
+        }
+    }
+
+    // Fallback: original slow walk
     var current: ?NodeIndex = node;
     while (current) |cur| {
         if (functionBodyNode(cur, ctx)) |body| return body;
@@ -2647,6 +2671,21 @@ fn containsThisDecl(prefix: []const u8, this_name: []const u8) bool {
 }
 
 fn getNearestLoopLabelName(loop_node: NodeIndex, ctx: *TransformContext) ?[]const u8 {
+    if (g_parent_session) |session| {
+        if (session.captureBoundaryOf(loop_node)) |boundary| {
+            // Only walk up to the capture boundary.
+            const target = loop_node;
+            while (getParentNode(target)) |parent| {
+                if (parent == boundary) break;
+                if (ctx.nodeTag(parent) != .labeled_statement) break;
+                if (ctx.nodeData(parent).unary != target) break;
+                return ctx.tokenSlice(ctx.mainToken(parent));
+            }
+            return null;
+        }
+    }
+
+    // Fallback: original walk
     const target = loop_node;
     while (getParentNode(target)) |parent| {
         if (ctx.nodeTag(parent) != .labeled_statement) break;
@@ -2754,6 +2793,22 @@ fn getLoopHeadVarNames(head: NodeIndex, ctx: *TransformContext) NameList {
 }
 
 fn findEnclosingWrappedLoop(loop_node: NodeIndex, ctx: *TransformContext) ?NodeIndex {
+    if (g_parent_session) |session| {
+        if (session.captureBoundaryOf(loop_node)) |boundary| {
+            // Only walk up to the capture boundary.
+            var current = getParentNode(loop_node);
+            while (current) |cur| {
+                if (cur == boundary) break;
+                if (isLoopNode(ctx.nodeTag(cur)) and collectLoopWrapInfo(cur, ctx) != null) {
+                    return cur;
+                }
+                current = getParentNode(cur);
+            }
+            return null;
+        }
+    }
+
+    // Fallback: original walk
     var current = getParentNode(loop_node);
     while (current) |cur| {
         const tag = ctx.nodeTag(cur);
@@ -3941,6 +3996,23 @@ fn isLoopNode(tag: Node.Tag) bool {
 }
 
 fn isProtectedByNestedWrappedLoop(node: NodeIndex, outer_loop: NodeIndex, ctx: *TransformContext) bool {
+    if (g_parent_session) |session| {
+        if (session.captureBoundaryOf(node)) |boundary| {
+            // Only walk up to the capture boundary.
+            var current = getParentNode(node);
+            while (current) |cur| {
+                if (cur == outer_loop) return false;
+                if (cur == boundary) break;
+                if (isLoopNode(ctx.nodeTag(cur)) and collectLoopWrapInfo(cur, ctx) != null) {
+                    return true;
+                }
+                current = getParentNode(cur);
+            }
+            return false;
+        }
+    }
+
+    // Fallback: original walk
     var current = getParentNode(node);
     while (current) |cur| {
         if (cur == outer_loop) return false;
@@ -4078,7 +4150,6 @@ fn applyTdzForDeclaration(idx: NodeIndex, ctx: *TransformContext) void {
     const decl_end = ctx.ast.nodes.items(.end_offset)[@intFromEnum(idx)];
     const names = getDeclaredNames(idx, ctx);
     if (names.len == 0) return;
-    ensureParentMap(ctx);
 
     const decl_binding_indices = collectDeclarationBindingIndices(scope_result, idx, scope_idx);
     if (decl_binding_indices.len == 0) return;
@@ -4262,6 +4333,14 @@ fn classifyFunctionDeclarationTdz(
 }
 
 fn findNearestFunctionLikeAncestor(node: NodeIndex, ctx: *TransformContext) ?NodeIndex {
+    if (g_parent_session) |session| {
+        // Fast path: use the precomputed function boundary (only functions, not classes)
+        if (session.functionBoundaryOf(node)) |fbound| {
+            return fbound;
+        }
+    }
+
+    // Fallback: original slow parent walk
     var current = getParentNode(node);
     while (current) |cur| {
         switch (ctx.nodeTag(cur)) {
@@ -4439,30 +4518,6 @@ fn bindingIndicesForName(ctx: *TransformContext, name: []const u8) ?[]const u32 
     const scope_result = ctx.scope orelse return null;
     const binding_indices = scope_result.binding_name_indices.get(name) orelse return null;
     return binding_indices.items;
-}
-
-fn ensureFunctionBindingQueryCaches(ctx: *TransformContext) void {
-    if (g_function_binding_query_cache_ready) return;
-    const scope_result = ctx.scope orelse return;
-
-    g_outer_binding_query_cache = ctx.allocator.alloc(FunctionBindingQueryCache, scope_result.scopes.len) catch &[_]FunctionBindingQueryCache{};
-    for (g_outer_binding_query_cache) |*map| map.* = .{};
-
-    g_function_scope_binding_query_cache = ctx.allocator.alloc(FunctionBindingQueryCache, scope_result.scopes.len) catch &[_]FunctionBindingQueryCache{};
-    for (g_function_scope_binding_query_cache) |*map| map.* = .{};
-
-    g_function_binding_query_cache_ready = true;
-}
-
-fn cacheFunctionBindingQuery(
-    ctx: *TransformContext,
-    caches: *[]FunctionBindingQueryCache,
-    scope_i: usize,
-    name: []const u8,
-    value: bool,
-) void {
-    if (scope_i >= caches.*.len) return;
-    caches.*[scope_i].put(ctx.allocator, name, if (value) 1 else 0) catch {};
 }
 
 /// Generate a unique name for a renamed variable.

@@ -29,6 +29,31 @@ fn functionBody(ast: *const zb.Ast, function_node: zb.NodeIndex) zb.NodeIndex {
     return @enumFromInt(ast.extra_data.items[extra_idx + 3]);
 }
 
+fn classBody(ast: *const zb.Ast, class_node: zb.NodeIndex) zb.NodeIndex {
+    const data = ast.nodes.items(.data)[@intFromEnum(class_node)];
+    const extra_idx = @intFromEnum(data.extra);
+    return @enumFromInt(ast.extra_data.items[extra_idx + 2]);
+}
+
+fn firstClassBodyElement(ast: *const zb.Ast, body_node: zb.NodeIndex) zb.NodeIndex {
+    const data = ast.nodes.items(.data)[@intFromEnum(body_node)];
+    const extra_idx = @intFromEnum(data.extra);
+    const range_start = ast.extra_data.items[extra_idx];
+    return @enumFromInt(ast.extra_data.items[range_start]);
+}
+
+fn freeStructuralData(alloc: std.mem.Allocator, structural: anytype) void {
+    if (structural.parent_map.len > 0) alloc.free(structural.parent_map);
+    if (structural.function_boundary_for_node.len > 0) alloc.free(structural.function_boundary_for_node);
+    if (structural.containing_function_node.len > 0) alloc.free(structural.containing_function_node);
+    if (structural.identifier_occurrences.len > 0) alloc.free(structural.identifier_occurrences);
+    if (structural.function_binding_name_nodes.len > 0) alloc.free(structural.function_binding_name_nodes);
+    if (structural.preorder_start.len > 0) alloc.free(structural.preorder_start);
+    if (structural.preorder_end.len > 0) alloc.free(structural.preorder_end);
+    if (structural.this_occurrences.len > 0) alloc.free(structural.this_occurrences);
+    if (structural.capture_boundary_for_node.len > 0) alloc.free(structural.capture_boundary_for_node);
+}
+
 fn firstBlockStatement(ast: *const zb.Ast, block_node: zb.NodeIndex) zb.NodeIndex {
     const data = ast.nodes.items(.data)[@intFromEnum(block_node)];
     const extra_idx = @intFromEnum(data.extra);
@@ -148,6 +173,33 @@ test "transform session indexes identifier occurrences by spelling and function 
     try std.testing.expectEqual(@as(usize, 1), outer_count);
     try std.testing.expectEqual(@as(usize, 2), arrow_count);
     try std.testing.expectEqual(outer_fn, session.functionBoundaryOf(outer_body).?);
+}
+
+test "transform session consumes structural identifier occurrences without scope analysis" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parsed = try zb.parseWithOptions(
+        alloc,
+        \\function outer(value) {
+        \\  return () => value;
+        \\}
+    ,
+        .{
+            .source_type = .script,
+            .language = .javascript,
+            .defer_comment_attachment = true,
+        },
+    );
+    defer parsed.deinit();
+
+    const structural = try zb.TransformSession.buildStructuralData(std.testing.allocator, &parsed.ast);
+    var session = try zb.TransformSession.initWithStructuralData(std.testing.allocator, &parsed.ast, null, structural);
+    defer session.deinit(std.testing.allocator);
+
+    const occurrences = session.identifierOccurrences("value") orelse return error.ExpectedOccurrences;
+    try std.testing.expectEqual(@as(usize, 2), occurrences.len);
 }
 
 test "transform session indexes arrow binding name nodes" {
@@ -352,4 +404,41 @@ test "transform session indexes this expressions in source order" {
     const first_range = session.subtreeRange(this_nodes[0]);
     const second_range = session.subtreeRange(this_nodes[1]);
     try std.testing.expect(first_range.start < second_range.start);
+}
+
+test "structural data keeps class capture boundaries separate from function boundaries" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parsed = try zb.parseWithOptions(
+        alloc,
+        \\class Box {
+        \\  method() {
+        \\    return this.value;
+        \\  }
+        \\}
+    ,
+        .{
+            .source_type = .script,
+            .language = .javascript,
+            .defer_comment_attachment = true,
+        },
+    );
+    defer parsed.deinit();
+
+    const structural = try zb.TransformSession.buildStructuralData(std.testing.allocator, &parsed.ast);
+    defer freeStructuralData(std.testing.allocator, structural);
+
+    const class_decl = firstProgramChild(&parsed.ast);
+    const class_body = classBody(&parsed.ast, class_decl);
+    const method_node = firstClassBodyElement(&parsed.ast, class_body);
+    const method_body = functionBody(&parsed.ast, method_node);
+
+    try std.testing.expectEqual(zb.Node.Tag.class_declaration, parsed.ast.nodes.items(.tag)[@intFromEnum(class_decl)]);
+    try std.testing.expectEqual(zb.Node.Tag.class_body, parsed.ast.nodes.items(.tag)[@intFromEnum(class_body)]);
+    try std.testing.expectEqual(class_decl, structural.capture_boundary_for_node[@intFromEnum(class_body)]);
+    try std.testing.expectEqual(zb.NodeIndex.none, structural.function_boundary_for_node[@intFromEnum(class_body)]);
+    try std.testing.expectEqual(method_node, structural.capture_boundary_for_node[@intFromEnum(method_body)]);
+    try std.testing.expectEqual(method_node, structural.function_boundary_for_node[@intFromEnum(method_body)]);
 }

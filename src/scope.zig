@@ -179,6 +179,15 @@ pub const ScopeResult = struct {
 
 pub const AnalyzeOptions = struct {
     extra_globals: []const []const u8 = &.{},
+    /// Optional pre-built function boundary map from a structural pass.
+    function_boundary_for_node: ?[]const NodeIndex = null,
+    /// Optional pre-built "containing function node" map from a structural pass.
+    /// For each AST node, which function/arrow node it belongs to.
+    /// This enables stronger O(1) fast paths in nearestFunctionScope etc.
+    containing_function_node: ?[]const NodeIndex = null,
+    /// Optional pre-built AST parent map from the structural pre-pass.
+    /// Can be used to accelerate upward walks in Scope Builder.
+    parent_map: ?[]const NodeIndex = null,
 };
 
 pub fn analyze(ast: *const Ast, allocator: Allocator) !ScopeResult {
@@ -395,6 +404,12 @@ const Builder = struct {
     /// Stack of scope indices during traversal
     scope_stack: std.ArrayListUnmanaged(ScopeIndex),
     options: AnalyzeOptions,
+    /// Optional pre-built function boundary map (from TransformSession or structural pre-pass).
+    function_boundary_for_node: ?[]const NodeIndex = null,
+    /// Optional pre-built containing function node map.
+    containing_function_node: ?[]const NodeIndex = null,
+    /// Optional pre-built AST parent map (from structural pre-pass).
+    parent_map: ?[]const NodeIndex = null,
 
     fn init(ast: *const Ast, allocator: Allocator, options: AnalyzeOptions) Builder {
         return .{
@@ -408,6 +423,9 @@ const Builder = struct {
             .node_to_binding = .{},
             .scope_stack = .empty,
             .options = options,
+            .function_boundary_for_node = options.function_boundary_for_node,
+            .containing_function_node = options.containing_function_node,
+            .parent_map = options.parent_map,
         };
     }
 
@@ -551,7 +569,38 @@ const Builder = struct {
     }
 
     /// Find the nearest function-level scope (function, arrow, global, module) walking up from current.
-    fn nearestFunctionScope(self: *const Builder) ScopeIndex {
+    fn nearestFunctionScope(self: *const Builder, current_node: NodeIndex) ScopeIndex {
+        // Prefer containing_function_node if provided (richer structural data)
+        if (self.containing_function_node) |cf| {
+            if (current_node != .none) {
+                const raw = @intFromEnum(current_node);
+                if (raw < cf.len) {
+                    const fn_node = cf[raw];
+                    if (fn_node != .none) {
+                        if (self.node_to_scope.get(@intFromEnum(fn_node))) |s| {
+                            return s;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback to function_boundary_for_node
+        if (self.function_boundary_for_node) |boundaries| {
+            if (current_node != .none) {
+                const raw = @intFromEnum(current_node);
+                if (raw < boundaries.len) {
+                    const fn_node = boundaries[raw];
+                    if (fn_node != .none) {
+                        if (self.node_to_scope.get(@intFromEnum(fn_node))) |s| {
+                            return s;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Final fallback: stack walk
         var i: usize = self.scope_stack.items.len;
         while (i > 0) {
             i -= 1;
@@ -566,8 +615,52 @@ const Builder = struct {
     }
 
     /// Check if an identifier node is across a function boundary from the binding scope.
-    fn crossesFunctionBoundary(self: *const Builder, binding_scope: ScopeIndex) bool {
-        // Walk up from current scope to binding_scope; if we pass a function/arrow scope, it's captured
+    fn crossesFunctionBoundary(self: *const Builder, binding_scope: ScopeIndex, current_node: NodeIndex) bool {
+        // Prefer containing_function_node (newer richer structural data)
+        if (self.containing_function_node) |cf| {
+            if (current_node != .none) {
+                const raw_cur = @intFromEnum(current_node);
+                if (raw_cur < cf.len) {
+                    const cur_fn = cf[raw_cur];
+                    const bscope = self.scopes.items[@intFromEnum(binding_scope)];
+                    const bind_node = bscope.node;
+                    if (bind_node != .none) {
+                        const raw_bind = @intFromEnum(bind_node);
+                        if (raw_bind < cf.len) {
+                            const bind_fn = cf[raw_bind];
+                            if (cur_fn != bind_fn) {
+                                return true;
+                            }
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback to function_boundary_for_node
+        if (self.function_boundary_for_node) |boundaries| {
+            if (current_node != .none) {
+                const raw_current = @intFromEnum(current_node);
+                if (raw_current < boundaries.len) {
+                    const current_fn = boundaries[raw_current];
+                    const bscope = self.scopes.items[@intFromEnum(binding_scope)];
+                    const binding_node = bscope.node;
+                    if (binding_node != .none) {
+                        const raw_bind = @intFromEnum(binding_node);
+                        if (raw_bind < boundaries.len) {
+                            const binding_fn = boundaries[raw_bind];
+                            if (current_fn != binding_fn) {
+                                return true;
+                            }
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback to original stack walk
         var i: usize = self.scope_stack.items.len;
         while (i > 0) {
             i -= 1;
@@ -582,7 +675,52 @@ const Builder = struct {
         return false;
     }
 
-    fn isScopeVisibleFromCurrent(self: *const Builder, candidate_scope: ScopeIndex) bool {
+    fn isScopeVisibleFromCurrent(self: *const Builder, candidate_scope: ScopeIndex, current_node: NodeIndex) bool {
+        // Fast path using AST parent_map + node_to_scope (when available)
+        if (self.parent_map) |pm| {
+            if (current_node != .none) {
+                var ancestor = current_node;
+                while (ancestor != .none) {
+                    const raw = @intFromEnum(ancestor);
+                    if (raw < pm.len) {
+                        if (self.node_to_scope.get(raw)) |node_scope| {
+                            if (node_scope == candidate_scope) return true;
+                            // If the candidate scope's declaration node is a structural ancestor
+                            // of the current node (via parent_map), then it is visible.
+                            const cand_scope = self.scopes.items[@intFromEnum(candidate_scope)];
+                            if (cand_scope.node != .none) {
+                                var anc = current_node; // note: current_node here is the original param
+                                const cand_raw = @intFromEnum(cand_scope.node);
+                                while (anc != .none) {
+                                    const araw = @intFromEnum(anc);
+                                    if (araw == cand_raw) return true;
+                                    if (araw >= pm.len) break;
+                                    const p = pm[araw];
+                                    if (p == .none) break;
+                                    anc = p;
+                                }
+                            }
+                            // Fallback: Check if candidate_scope is an ancestor of node_scope via scope parents
+                            var check = node_scope;
+                            while (true) {
+                                if (check == candidate_scope) return true;
+                                const parent = self.scopes.items[@intFromEnum(check)].parent orelse break;
+                                if (@intFromEnum(parent) >= self.scopes.items.len) break;
+                                check = parent;
+                                if (@intFromEnum(check) == @intFromEnum(candidate_scope)) return true;
+                            }
+                        }
+                        const parent_raw = pm[raw];
+                        if (parent_raw == .none) break;
+                        ancestor = parent_raw;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Fallback to original scope-parent chain walk
         var current: ?ScopeIndex = self.currentScope();
         while (current) |scope_idx| {
             if (scope_idx == candidate_scope) return true;
@@ -591,13 +729,13 @@ const Builder = struct {
         return false;
     }
 
-    fn findVisibleBindingIndex(self: *const Builder, name: []const u8) ?u32 {
+    fn findVisibleBindingIndex(self: *const Builder, name: []const u8, current_node: NodeIndex) ?u32 {
         const binding_indices = self.binding_name_indices.get(name) orelse return null;
         var i = binding_indices.items.len;
         while (i > 0) {
             i -= 1;
             const binding_idx = binding_indices.items[i];
-            if (self.isScopeVisibleFromCurrent(self.bindings.items[binding_idx].scope)) return binding_idx;
+            if (self.isScopeVisibleFromCurrent(self.bindings.items[binding_idx].scope, current_node)) return binding_idx;
         }
         return null;
     }
@@ -761,7 +899,7 @@ const Builder = struct {
         // Register function name in nearest function scope (hoisted)
         if (name_token_raw != 0 and name_token_raw != @intFromEnum(NodeIndex.none)) {
             const name = self.ast.tokenSlice(@enumFromInt(name_token_raw));
-            const fn_scope = self.nearestFunctionScope();
+            const fn_scope = self.nearestFunctionScope(idx);
             try self.addBinding(name, .function_decl, fn_scope, idx, .{ .decl_node = idx });
         }
 
@@ -1083,7 +1221,7 @@ const Builder = struct {
 
                 // For var: register in nearest function scope (hoisted)
                 // For let/const: register in current scope
-                const target_scope = if (kind == .var_decl) self.nearestFunctionScope() else self.currentScope();
+                const target_scope = if (kind == .var_decl) self.nearestFunctionScope(decl_idx) else self.currentScope();
                 try self.ensureBindingNamesInScope(binding_node, kind, target_scope, .{
                     .decl_node = decl_idx,
                     .init_node = decl_data.binary.rhs,
@@ -1193,9 +1331,9 @@ const Builder = struct {
         const mt = self.ast.nodes.items(.main_token)[i];
         const name = self.ast.tokenSlice(mt);
 
-        const binding_idx = self.findVisibleBindingIndex(name) orelse return;
+        const binding_idx = self.findVisibleBindingIndex(name, idx) orelse return;
         self.node_to_binding.putDirect(i, binding_idx);
-        if (self.crossesFunctionBoundary(self.bindings.items[binding_idx].scope)) {
+        if (self.crossesFunctionBoundary(self.bindings.items[binding_idx].scope, idx)) {
             self.bindings.items[binding_idx].is_captured = true;
         }
     }
@@ -1238,7 +1376,7 @@ const Builder = struct {
     }
 
     fn markMutated(self: *Builder, name: []const u8, mutation_node: NodeIndex) void {
-        const binding_idx = self.findVisibleBindingIndex(name) orelse return;
+        const binding_idx = self.findVisibleBindingIndex(name, mutation_node) orelse return;
         self.bindings.items[binding_idx].is_mutated = true;
         self.binding_mutations.items[binding_idx].append(self.allocator, @intFromEnum(mutation_node)) catch {};
     }
@@ -1287,7 +1425,7 @@ const Builder = struct {
 
             const decl_data = self.ast.nodes.items(.data)[decl_i];
             const binding_node = decl_data.binary.lhs;
-            const target_scope = if (kind == .var_decl) self.nearestFunctionScope() else self.currentScope();
+            const target_scope = if (kind == .var_decl) self.nearestFunctionScope(decl_idx) else self.currentScope();
             try self.ensureBindingNamesInScope(binding_node, kind, target_scope, .{
                 .decl_node = decl_idx,
                 .init_node = decl_data.binary.rhs,

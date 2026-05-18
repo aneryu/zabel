@@ -38,16 +38,17 @@ pub var g_body_temps: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged([]con
 
 pub fn createPass(config: Config) Pass {
     g_config = config;
-    var filter = visitor.NodeTagBitSet.initEmpty();
-    filter.set(@intFromEnum(Node.Tag.var_declaration));
-    filter.set(@intFromEnum(Node.Tag.let_declaration));
-    filter.set(@intFromEnum(Node.Tag.const_declaration));
-    filter.set(@intFromEnum(Node.Tag.for_in_statement));
-    filter.set(@intFromEnum(Node.Tag.for_of_statement));
-    filter.set(@intFromEnum(Node.Tag.assignment_expr));
+    var exit_filter = visitor.NodeTagBitSet.initEmpty();
+    exit_filter.set(@intFromEnum(Node.Tag.var_declaration));
+    exit_filter.set(@intFromEnum(Node.Tag.let_declaration));
+    exit_filter.set(@intFromEnum(Node.Tag.const_declaration));
+    exit_filter.set(@intFromEnum(Node.Tag.for_in_statement));
+    exit_filter.set(@intFromEnum(Node.Tag.for_of_statement));
+    exit_filter.set(@intFromEnum(Node.Tag.assignment_expr));
     return .{
         .name = "destructuring",
-        .node_filter = filter,
+        .node_filter = visitor.NodeTagBitSet.initEmpty(),
+        .exit_filter = exit_filter,
         .exit = enterNode,
         .priority = 28, // Run before block-scoping (30) but after block-scoped-functions (25)
     };

@@ -76,20 +76,21 @@ var g_replacement_ranges: std.ArrayListUnmanaged(ReplacementRange) = .empty;
 
 pub fn createPass(config: Config) Pass {
     g_config = config;
-    var filter = visitor.NodeTagBitSet.initEmpty();
-    filter.set(@intFromEnum(Node.Tag.function_declaration));
-    filter.set(@intFromEnum(Node.Tag.function_expr));
-    filter.set(@intFromEnum(Node.Tag.async_function_declaration));
-    filter.set(@intFromEnum(Node.Tag.generator_declaration));
-    filter.set(@intFromEnum(Node.Tag.async_generator_declaration));
-    filter.set(@intFromEnum(Node.Tag.arrow_function_expr));
-    filter.set(@intFromEnum(Node.Tag.method_definition));
-    filter.set(@intFromEnum(Node.Tag.class_method));
-    filter.set(@intFromEnum(Node.Tag.class_private_method));
-    filter.set(@intFromEnum(Node.Tag.setter));
+    var exit_filter = visitor.NodeTagBitSet.initEmpty();
+    exit_filter.set(@intFromEnum(Node.Tag.function_declaration));
+    exit_filter.set(@intFromEnum(Node.Tag.function_expr));
+    exit_filter.set(@intFromEnum(Node.Tag.async_function_declaration));
+    exit_filter.set(@intFromEnum(Node.Tag.generator_declaration));
+    exit_filter.set(@intFromEnum(Node.Tag.async_generator_declaration));
+    exit_filter.set(@intFromEnum(Node.Tag.arrow_function_expr));
+    exit_filter.set(@intFromEnum(Node.Tag.method_definition));
+    exit_filter.set(@intFromEnum(Node.Tag.class_method));
+    exit_filter.set(@intFromEnum(Node.Tag.class_private_method));
+    exit_filter.set(@intFromEnum(Node.Tag.setter));
     return .{
         .name = "parameters",
-        .node_filter = filter,
+        .node_filter = visitor.NodeTagBitSet.initEmpty(), // no enter work
+        .exit_filter = exit_filter,
         .exit = enterNode, // Use exit so child transforms (spread) run first
         .priority = 35, // Run after arrow-functions (20) and block-scoping (30)
     };
@@ -5955,7 +5956,8 @@ fn isDirectChildOfParenthesizedExpr(ctx: *TransformContext, node: NodeIndex) boo
 }
 
 fn findParentOf(ctx: *TransformContext, target: NodeIndex) ?NodeIndex {
-    ensureParentMap(ctx);
+    // ensureParentMap is expected to have been called by the caller (or earlier in the pass).
+    // We still check g_parent_session for robustness.
     if (g_parent_session) |session| {
         if (session.parentOf(target)) |parent| return parent;
     }
@@ -5970,11 +5972,22 @@ fn findParentOf(ctx: *TransformContext, target: NodeIndex) ?NodeIndex {
     return findParentOfSlow(ctx, target);
 }
 
+/// Returns true if the given node is inside a function or class (i.e., has a capture boundary).
+/// This is a small helper to make future migration of parent-walking logic cleaner (symmetric with block_scoping).
+fn hasCaptureBoundary(node: NodeIndex) bool {
+    if (g_parent_session) |session| {
+        return session.captureBoundaryOf(node) != null;
+    }
+    return false;
+}
+
 fn ensureParentMap(ctx: *TransformContext) void {
     if (ctx.session) |session| {
         g_parent_session = session;
         return;
     }
+    // Legacy fallback: build our own parent map only if no TransformSession is provided.
+    // In normal pipeline runs (needs_scope = true), the shared session is always available.
     const node_count = ctx.ast.nodes.items(.tag).len;
     if (g_node_parents_ready and g_node_parents.len == node_count) return;
 

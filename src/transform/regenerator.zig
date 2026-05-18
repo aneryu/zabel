@@ -22,11 +22,12 @@ const BodyPattern = union(enum) {
 var g_machine_counter: u32 = 0;
 
 pub fn createPass(_: Config) Pass {
-    var filter = visitor.NodeTagBitSet.initEmpty();
-    filter.set(@intFromEnum(Node.Tag.function_expr));
+    var exit_filter = visitor.NodeTagBitSet.initEmpty();
+    exit_filter.set(@intFromEnum(Node.Tag.function_expr));
     return .{
         .name = "regenerator",
-        .node_filter = filter,
+        .node_filter = visitor.NodeTagBitSet.initEmpty(),
+        .exit_filter = exit_filter,
         .exit = exitNode,
         .priority = 45,
     };

@@ -351,6 +351,9 @@ pub const Pipeline = struct {
         // Run scope analysis if any pass needs it.
         var scope_result: ?scope_mod.ScopeResult = null;
         var scope_analysis_ns: ?u64 = null;
+
+        var structural: ?session_mod.StructuralData = null;
+
         if (self.needs_scope) {
             var scope_span = if (self.telemetry_session) |session|
                 session.startSpan(spanPtr(&pipeline_span), .pass, "phase", "scope_analysis", &.{})
@@ -358,8 +361,23 @@ pub const Pipeline = struct {
                 null;
             var scope_error = false;
             const scope_started_ns = if (record_timings) monotonicNowNs() else 0;
+
+            // Lightweight structural pre-pass (Phase 3 Option A):
+            // One DFS to build parent_map + function_boundary_for_node.
+            // This data accelerates Scope Analysis and is reused by TransformSession.
+            structural = session_mod.TransformSession.buildStructuralData(
+                self.allocator,
+                ast,
+            ) catch null;
+
+            const boundary_slice = if (structural) |s| s.function_boundary_for_node else null;
+            const parent_slice = if (structural) |s| s.parent_map else null;
+
             scope_result = scope_mod.analyzeWithOptions(ast, self.allocator, .{
                 .extra_globals = self.scope_extra_globals,
+                .function_boundary_for_node = boundary_slice,
+                .containing_function_node = if (structural) |s| s.containing_function_node else null,
+                .parent_map = parent_slice,
             }) catch blk: {
                 scope_error = true;
                 break :blk null;
@@ -377,12 +395,15 @@ pub const Pipeline = struct {
         var transient_transform_session: ?session_mod.TransformSession = null;
         defer if (transient_transform_session) |*session| session.deinit(self.allocator);
         var ctx_session: ?*session_mod.TransformSession = null;
+
         if (self.needs_scope or self.requires_transform_session) {
             const session_started_ns = if (record_timings) monotonicNowNs() else 0;
-            transient_transform_session = try session_mod.TransformSession.init(
+
+            transient_transform_session = try session_mod.TransformSession.initWithStructuralData(
                 self.allocator,
                 ast,
                 if (scope_result) |*sr| sr else null,
+                structural,
             );
             if (record_timings) {
                 transform_session_ns = monotonicNsDelta(session_started_ns, monotonicNowNs());
@@ -779,10 +800,18 @@ pub const Pipeline = struct {
 };
 
 fn monotonicNowNs() u64 {
-    var ts: std.os.linux.timespec = undefined;
-    const rc = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    if (rc != 0) return 0;
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .linux) {
+        var ts: std.os.linux.timespec = undefined;
+        const rc = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+        if (rc != 0) return 0;
+        return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    } else {
+        var ts: std.c.timespec = undefined;
+        const rc = std.c.clock_gettime(.MONOTONIC, &ts);
+        if (rc != 0) return 0;
+        return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    }
 }
 
 fn monotonicNsDelta(start_ns: u64, end_ns: u64) ?u64 {

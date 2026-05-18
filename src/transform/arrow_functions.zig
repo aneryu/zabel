@@ -40,11 +40,12 @@ var g_has_literal_arguments_replacements = false;
 
 pub fn createPass(config: Config) Pass {
     g_config = config;
-    var filter = visitor.NodeTagBitSet.initEmpty();
-    filter.set(@intFromEnum(Node.Tag.arrow_function_expr));
+    var exit_filter = visitor.NodeTagBitSet.initEmpty();
+    exit_filter.set(@intFromEnum(Node.Tag.arrow_function_expr));
     return .{
         .name = "arrow_functions",
-        .node_filter = filter,
+        .node_filter = visitor.NodeTagBitSet.initEmpty(), // no enter work
+        .exit_filter = exit_filter,
         .exit = exitNode,
         .priority = 20,
     };

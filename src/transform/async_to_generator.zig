@@ -12,12 +12,13 @@ pub const Config = struct {};
 var g_ref_counter: u32 = 0;
 
 pub fn createPass(_: Config) Pass {
-    var filter = visitor.NodeTagBitSet.initEmpty();
-    filter.set(@intFromEnum(Node.Tag.function_expr));
-    filter.set(@intFromEnum(Node.Tag.arrow_function_expr));
+    var exit_filter = visitor.NodeTagBitSet.initEmpty();
+    exit_filter.set(@intFromEnum(Node.Tag.function_expr));
+    exit_filter.set(@intFromEnum(Node.Tag.arrow_function_expr));
     return .{
         .name = "async_to_generator",
-        .node_filter = filter,
+        .node_filter = visitor.NodeTagBitSet.initEmpty(),
+        .exit_filter = exit_filter,
         .exit = exitNode,
         .priority = 40,
     };

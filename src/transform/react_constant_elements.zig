@@ -9,11 +9,12 @@ const visitor = @import("visitor.zig");
 pub fn resetState() void {}
 
 pub fn createPass() Pass {
-    var filter = visitor.NodeTagBitSet.initEmpty();
-    filter.set(@intFromEnum(Node.Tag.declarator));
+    var exit_filter = visitor.NodeTagBitSet.initEmpty();
+    exit_filter.set(@intFromEnum(Node.Tag.declarator));
     return .{
         .name = "react_constant_elements",
-        .node_filter = filter,
+        .node_filter = visitor.NodeTagBitSet.initEmpty(),
+        .exit_filter = exit_filter,
         .exit = exitNode,
         .priority = 204,
     };

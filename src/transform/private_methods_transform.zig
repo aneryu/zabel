@@ -20,13 +20,14 @@ pub fn resetState() void {
 pub fn createPass(config: Config) Pass {
     g_config = config;
 
-    var filter = visitor.NodeTagBitSet.initEmpty();
-    filter.set(@intFromEnum(Node.Tag.class_declaration));
-    filter.set(@intFromEnum(Node.Tag.class_expr));
+    var exit_filter = visitor.NodeTagBitSet.initEmpty();
+    exit_filter.set(@intFromEnum(Node.Tag.class_declaration));
+    exit_filter.set(@intFromEnum(Node.Tag.class_expr));
 
     return .{
         .name = "private_methods",
-        .node_filter = filter,
+        .node_filter = visitor.NodeTagBitSet.initEmpty(),
+        .exit_filter = exit_filter,
         .exit = exitNode,
         .priority = 18,
     };
